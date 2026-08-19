@@ -1,5 +1,7 @@
-import yaml
 from pathlib import Path
+
+import yaml
+
 
 def load_config()->dict:
     """Loads configuration from config.yaml file."""
