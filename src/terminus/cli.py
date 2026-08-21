@@ -8,6 +8,7 @@ from rich.prompt import Prompt
 from terminus.config import CONFIG
 from terminus.context.indexers.semantic_chroma import index_codebase
 from terminus.llm.factory import get_embedder, get_llm
+from terminus.agent.orchestrator import handle_query
 from terminus.observability.logging import get_logger
 
 load_dotenv()
@@ -32,8 +33,8 @@ def run():
     while True:
         query = Prompt.ask("[bold green]Query[/bold green]")
         user_input = query.lower()
-        logger.info(f"Query: {query}")
-        console.print(f"Response: {query}")
+        # logger.info(f"Query: {query}")
+        # console.print(f"Response: {query}")
         if user_input == "":
             console.print("[bold red]Please enter a query[/bold red]")
             continue
@@ -49,9 +50,20 @@ def run():
                 console.print("[bold red]Please enter a question[/bold red]")
                 continue
             console.print(f"[bold green]Question:[/bold green] {question}")
+            response = handle_query(question)
+            console.print(f"[bold blue]Response:[/bold blue] {response}")
         elif user_input.startswith("/show_semantic_index"):
             console.print("[bold green]Showing semantic index...[/bold green]")
             show_semantic_index(collection)
+        elif user_input.startswith("/help"):
+            console.print("[bold green]Help:[/bold green]")
+            console.print("\n[bold green]Commands:[/bold green]")
+            console.print("[yellow] /ask 'Question Here' - Ask a question about codebase[/yellow]")
+            console.print("[yellow] /clear - Clear the screen[/yellow]")
+            console.print("[yellow] /exit - Exit the CLI[/yellow]")
+            console.print("[yellow] /quit - Exit the CLI[/yellow]")
+            console.print("[yellow] /help - Show this help message[/yellow]")
+            console.print("[yellow] /show_semantic_index - Show semantic index stats[/yellow]")
             
         else:
             logger.warning("Invalid query", extra={"query": query})
@@ -67,8 +79,7 @@ def run():
 def get_or_create_index()->chromadb.Collection:
     chroma_client = chromadb.PersistentClient(path=CONFIG["chromadb"]["persist_dir"])
     collection = chroma_client.get_or_create_collection(
-        name=CONFIG["chromadb"]["collection_name"],
-        embedding_function=get_embedder()
+        name=CONFIG["chromadb"]["collection_name"]
     )
     if collection.count() > 0:
         logger.info(f"Found existing index with {collection.count()} chunks.")

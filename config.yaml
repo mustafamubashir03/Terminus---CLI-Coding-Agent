@@ -1,6 +1,6 @@
 llm:
-  provider: openai
-  model: gpt-4o
+  provider: fireworks
+  model: kimi-k3
 
 embeddings:
   provider: huggingface

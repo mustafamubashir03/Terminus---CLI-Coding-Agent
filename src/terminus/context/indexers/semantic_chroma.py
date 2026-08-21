@@ -13,8 +13,7 @@ def index_codebase(repo_path: str)->chromadb.Collection:
     embedder = get_embedder()
     chroma_client = chromadb.PersistentClient(path=CONFIG["chromadb"]["persist_dir"])
     collection = chroma_client.get_or_create_collection(
-        name=CONFIG["chromadb"]["collection_name"],
-        embedding_function=embedder
+        name=CONFIG["chromadb"]["collection_name"]
     )
     logger.info(f"Starting semantic indexing of {repo_path}...")
 
