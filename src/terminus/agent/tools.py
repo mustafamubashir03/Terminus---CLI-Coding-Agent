@@ -1,5 +1,5 @@
+from terminus.context.retrievers.factory import get_retriever
 from langchain.tools import tool
-from terminus.context.retrievers.semantic_chroma import retrieve
 from terminus.observability.logging import get_logger
 
 logger = get_logger(__name__)
@@ -7,7 +7,7 @@ logger = get_logger(__name__)
 @tool
 def search_codebase(query: str) -> str:
     """ Retrieves chunks from the codebase based on the query"""
-
+    retrieve = get_retriever()
     chunks = retrieve(query,k=5)
     if not chunks:
         return "No relevant code found"
@@ -18,7 +18,7 @@ def search_codebase(query: str) -> str:
             f"File: {chunk['source']} (lines {chunk['start_line']}-{chunk['end_line']})\n"
             f"Type: {chunk['type']}\n"
             f"Name: {chunk['name']}\n"
-            f"Code:\n{chunk['document']}"
+            f"Code:\n{chunk['content']}"
         )
     return "\n---\n".join(results)
     

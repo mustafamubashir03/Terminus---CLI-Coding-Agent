@@ -31,7 +31,7 @@ def retrieve(query: str, k: int = 5) -> list[dict]:
     chunks = []
     for doc, meta in zip(docs, metas):
         chunks.append({
-            "document": doc,
+            "content": doc,
             "source": meta["source"],
             "name": meta["name"],
             "type": meta["type"],
@@ -40,4 +40,4 @@ def retrieve(query: str, k: int = 5) -> list[dict]:
         })
         logger.debug(f"Retrieved {meta['type']} {meta['source']}:{meta['name']}")
     logger.info(f"Retrieved {len(chunks)} chunks for query: {query}")
-    return chunks
+    return chunks
