@@ -2,7 +2,6 @@ from langchain_core.documents import Document
 import os
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams
 
 from terminus.observability.logging import get_logger
 from terminus.config import CONFIG
@@ -22,6 +21,7 @@ def get_or_create_qdrant_index(repo_path: str)->QdrantVectorStore:
     if(not cluster_endpoint):
         logger.error("CLUSTER_ENDPOINT not found in .env file")
         raise ValueError("CLUSTER_ENDPOINT not found in .env file")
+    embedder = get_embedder()
     client = QdrantClient(url=cluster_endpoint, api_key=api_key)
     existing = [c.name for c in client.get_collections().collections]
     if collection_name in existing:
@@ -30,7 +30,7 @@ def get_or_create_qdrant_index(repo_path: str)->QdrantVectorStore:
             logger.info("Collection already exists with points. Skipping indexing")
             return QdrantVectorStore.from_existing_collection(
                 collection_name=collection_name,
-                client=client,
+                embedding=embedder,
                 url=cluster_endpoint,
                 api_key=api_key,
             )
@@ -56,7 +56,6 @@ def get_or_create_qdrant_index(repo_path: str)->QdrantVectorStore:
                 }
             ))
             logger.debug(f"Embedded and stored {chunk.source}:{chunk.start_line}-{chunk.end_line}")
-    embedder = get_embedder()
     vector_store = QdrantVectorStore.from_documents(
         documents=docs,
         embedding=embedder,
@@ -65,7 +64,7 @@ def get_or_create_qdrant_index(repo_path: str)->QdrantVectorStore:
         api_key=api_key,
         batch_size=50
     )
-    logger.info(f"Semantic indexing completed. Indexed {len(files)} files into {vector_store.collection.count()} chunks")
+    logger.info(f"Semantic indexing completed. Indexed {len(files)} files into {vector_store.collection_name} chunks")
     return vector_store
 
 
@@ -75,7 +74,7 @@ def show_qdrant_semantic_index(vector_store: QdrantVectorStore)->None:
     console = Console()
     client = vector_store.client
     collection_name = CONFIG["qdrant"]["collection_name"]
-    results = client.scroll(collection_name=collection_name, with_payload=True)
+    results = client.scroll(collection_name=collection_name, with_payload=True,with_vectors=True)
     points = results[0]
     console.print(f"Total points: {len(points)}")
     
@@ -83,11 +82,17 @@ def show_qdrant_semantic_index(vector_store: QdrantVectorStore)->None:
         payload = point.payload
         embedding = point.vector
         console.print(f"[bold cyan] Chunk {i+1}:[/bold cyan] {payload}")
-        console.print(f"File: {payload['source']}")
-        console.print(f"Name: {payload['name']}")
-        console.print(f"Lines: {payload['start_line']}-{payload['end_line']}")
-        console.print(f"\n[bold]Code:[/bold]\n[code]{payload.get('page_content','')[0:300]}[/code]...\n")
-        console.print(f"[bold green] Embedding [{len(embedding)}]: {', '.join(f'{v: .4f}' for v in embedding[:5])} ...")
+        console.print(f"File: {payload['metadata']['source']}")
+        console.print(f"Name: {payload['metadata']['name']}")
+        console.print(f"Lines: {payload['metadata']['start_line']}-{payload['metadata']['end_line']}")
+        console.print(
+            f"\n[bold]Code:[/bold]\n"
+            f"[code]{payload.get('page_content', '')[:300]}[/code]...\n"
+        )
+        console.print(
+            f"[bold green]Embedding [{len(embedding)}]: "
+            f"{', '.join(f'{v:.4f}' for v in embedding[:5])} ..."
+        )
         console.print("-" * 50)
     
     

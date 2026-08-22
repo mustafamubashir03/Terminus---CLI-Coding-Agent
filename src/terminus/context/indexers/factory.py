@@ -12,14 +12,14 @@ def get_or_create_indexer(repo_path:str):
     else:
         raise ValueError(f"Unknown indexer provider: {provider}")
 
-def show_index():
+def show_index(index):
     provider = CONFIG["vector_store"]["provider"]
     if provider == "qdrant":
         from terminus.context.indexers.semantic_qdrant import show_qdrant_semantic_index
-        return show_qdrant_semantic_index()
+        return show_qdrant_semantic_index(index)
     if provider == "chromadb":
         from terminus.context.indexers.semantic_chroma import show_chroma_semantic_index
-        return show_chroma_semantic_index()
+        return show_chroma_semantic_index(index)
     else:
         raise ValueError(f"Unknown indexer provider: {provider}")   
     
