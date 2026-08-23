@@ -1,4 +1,5 @@
-
+from terminus.memory.session import switch_session,get_current_session
+import uuid
 from pathlib import Path
 from dotenv import load_dotenv
 from rich.console import Console
@@ -29,7 +30,8 @@ def run():
     console.print("Type [bold cyan]'/clear'[/bold cyan] to clear the screen")
     _llm, _embedder, index = initialize()
     while True:
-        query = Prompt.ask("[bold green]Query[/bold green]")
+        session_id = get_current_session()
+        query = Prompt.ask(f"[bold green]Query >> [/bold green]")
         user_input = query.lower()
         if user_input == "":
             console.print("[bold red]Please enter a query[/bold red]")
@@ -37,6 +39,19 @@ def run():
         elif user_input in ["/exit","/quit"]:
             console.print("[bold blue]Goodbye![/bold blue]")
             break
+        elif user_input == "/session":
+            console.print(f"[bold green]Current Session:[/bold green] {session_id}")
+        elif user_input == "/new_session":
+            session_id = str(uuid.uuid4())
+            switch_session(session_id)
+            console.print(f"[bold green]New session created:[/bold green] {session_id}")
+        elif user_input.startswith("/switch"):
+            session_id = user_input.removeprefix("/switch ").strip()
+            if not session_id:
+                console.print("[bold red]Please enter a session ID[/bold red]")
+                continue
+            switch_session(session_id)
+            console.print(f"[bold green]Switched to session:[/bold green] {session_id}")
         elif user_input == "/clear":
             console.clear()
             continue
@@ -46,7 +61,7 @@ def run():
                 console.print("[bold red]Please enter a question[/bold red]")
                 continue
             console.print(f"[bold green]Question:[/bold green] {question}")
-            response = handle_query(question)
+            response = handle_query(question,session_id)
             console.print(f"[bold blue]Response:[/bold blue] {response}")
         elif user_input.startswith("/show_semantic_index"):
             console.print("[bold green]Showing semantic index...[/bold green]")
@@ -54,11 +69,14 @@ def run():
         elif user_input.startswith("/help"):
             console.print("[bold green]Help:[/bold green]")
             console.print("\n[bold green]Commands:[/bold green]")
-            console.print("[yellow] /ask 'Question Here' - Ask a question about codebase[/yellow]")
+            console.print("[yellow] /ask <question> - Ask a question about codebase[/yellow]")
             console.print("[yellow] /clear - Clear the screen[/yellow]")
             console.print("[yellow] /exit - Exit the CLI[/yellow]")
             console.print("[yellow] /quit - Exit the CLI[/yellow]")
             console.print("[yellow] /help - Show this help message[/yellow]")
+            console.print("[yellow] /session - Show current session[/yellow]")
+            console.print("[yellow] /new_session - Create a new session[/yellow]")
+            console.print("[yellow] /switch <session_id> - Switch to a session[/yellow]")
             console.print("[yellow] /show_semantic_index - Show semantic index stats[/yellow]")
         else:
             logger.warning("Invalid query", extra={"query": query})

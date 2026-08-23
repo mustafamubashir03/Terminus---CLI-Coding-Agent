@@ -2,6 +2,11 @@ llm:
   provider: fireworks
   model: kimi-k3
 
+memory:
+  db_path: .memory/terminus.db
+  summarize_at_tokens: 4000
+  max_messages: 20
+
 rag:
   mode: hybrid
 
