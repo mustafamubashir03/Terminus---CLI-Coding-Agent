@@ -2,11 +2,15 @@ llm:
   provider: fireworks
   model: kimi-k3
 
+rag:
+  mode: hybrid
+
 vector_store:
   provider: qdrant
+  retrieval_mode: hybrid
 
 qdrant:
-  collection_name: terminus
+  collection_name: terminus_hybrid
 
 embeddings:
   provider: huggingface
