@@ -1,7 +1,9 @@
 from terminus.memory.short_term import get_summarization_middleware
 from terminus.memory.short_term import get_checkpointer
 from terminus.llm.factory import get_llm
-from terminus.agent.tools import search_codebase
+from terminus.agent.tools.filesystem_tools import read_file,write_file,delete_file,list_directory,file_exists,append_file
+from terminus.agent.tools.terminal_tools import run_in_directory,run_command
+from terminus.agent.tools.codebase_tool import search_codebase
 from terminus.observability.logging import get_logger
 from langchain.agents import create_agent
 from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
@@ -20,7 +22,7 @@ ALWAYS give a final text answer."""
 def build_agent():
     """ Create and return a langchain agent"""
     llm = get_llm()
-    tools = [search_codebase]
+    tools = [search_codebase,read_file, write_file,delete_file,list_directory,file_exists,append_file,run_in_directory,run_command]
     logger.info("Creating agent")
     checkpointer = get_checkpointer()
     middlewares = [

@@ -6,7 +6,7 @@ logger = get_logger(__name__)
 
 @tool
 def search_codebase(query: str) -> str:
-    """ Retrieves chunks from the codebase based on the query"""
+    """ Retrieves chunks from the codebase based on the query if requires."""
     retrieve = get_retriever()
     chunks = retrieve(query,k=5)
     if not chunks:
@@ -18,7 +18,7 @@ def search_codebase(query: str) -> str:
             f"File: {chunk['source']} (lines {chunk['start_line']}-{chunk['end_line']})\n"
             f"Type: {chunk['type']}\n"
             f"Name: {chunk['name']}\n"
-            f"Code:\n{chunk['content']}"
+            f"Code:\n{chunk['content']}\n\n"
         )
     return "\n---\n".join(results)
     

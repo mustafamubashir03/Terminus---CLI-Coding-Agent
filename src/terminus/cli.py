@@ -9,14 +9,18 @@ from terminus.llm.factory import get_embedder, get_llm
 from terminus.agent.orchestrator import handle_query
 from terminus.observability.logging import get_logger
 
-load_dotenv()
 console = Console()
 logger = get_logger(__name__)
 
 def initialize():
     logger.info("Initializing Terminus...")
+    repo_path = Path.cwd()
+    env_file = repo_path / ".env"
+    if not env_file.exists():
+        console.print("[bold red]No .env file found in the current directory[/bold red]")
+        raise FileNotFoundError("No .env file found in the current directory")
+    load_dotenv(env_file)
     llm = get_llm()
-    repo_path = str(Path.cwd())
     embedder = get_embedder()
     index = get_or_create_indexer(repo_path)
     logger.info("Terminus initialized successfully")
