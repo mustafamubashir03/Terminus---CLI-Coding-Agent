@@ -1,3 +1,5 @@
+from terminus.mcp.terminus_mcp_client import get_terminus_mcp_tools
+import asyncio
 from terminus.memory.session import switch_session,get_current_session
 import uuid
 from pathlib import Path
@@ -27,7 +29,7 @@ def initialize():
     return llm, embedder, index
 
 
-def run():
+async def terminus_cli_run():
     logger.info("Starting Terminus CLI")
     console.print("[bold blue]Welcome to Terminus![/bold blue]")
     console.print("Type [bold red]'/exit'[/bold red] or [bold red]'/quit'[/bold red] to quit")
@@ -65,7 +67,7 @@ def run():
                 console.print("[bold red]Please enter a question[/bold red]")
                 continue
             console.print(f"[bold green]Question:[/bold green] {question}")
-            response = handle_query(question,session_id)
+            response = await handle_query(question,session_id)
             console.print(f"[bold blue]Response:[/bold blue] {response}")
         elif user_input.startswith("/show_semantic_index"):
             console.print("[bold green]Showing semantic index...[/bold green]")
@@ -91,4 +93,8 @@ def run():
         
 
 
-        
+
+
+def run():
+    """Sync entry point required by pyproject.toml scripts — bootstraps the async event loop."""
+    asyncio.run(terminus_cli_run())

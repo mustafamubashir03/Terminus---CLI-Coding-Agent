@@ -1,12 +1,14 @@
+from terminus.mcp.terminus_mcp_client import get_terminus_mcp_tools
 from terminus.memory.short_term import get_summarization_middleware
 from terminus.memory.short_term import get_checkpointer
 from terminus.llm.factory import get_llm
-from terminus.agent.tools.filesystem_tools import read_file,write_file,delete_file,list_directory,file_exists,append_file
-from terminus.agent.tools.terminal_tools import run_in_directory,run_command
-from terminus.agent.tools.codebase_tool import search_codebase
+from terminus.tools.filesystem_tools import read_file,write_file,delete_file,list_directory,file_exists,append_file
+from terminus.tools.terminal_tools import run_in_directory,run_command
+from terminus.tools.codebase_tool import search_codebase
 from terminus.observability.logging import get_logger
 from langchain.agents import create_agent
 from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
+from typing import Any
 
 logger = get_logger(__name__)
 
@@ -19,13 +21,14 @@ RULES (follow strictly):
 
 ALWAYS give a final text answer."""
 
-def build_agent():
+async def build_agent():
     """ Create and return a langchain agent"""
     llm = get_llm()
-    tools = [search_codebase,read_file, write_file,delete_file,list_directory,file_exists,append_file,run_in_directory,run_command]
+    mcp_tools= await get_terminus_mcp_tools()
+    tools = [search_codebase,read_file, write_file,delete_file,list_directory,file_exists,append_file,run_in_directory,run_command,*mcp_tools]
     logger.info("Creating agent")
-    checkpointer = get_checkpointer()
-    middlewares = [
+    checkpointer = await get_checkpointer()
+    middlewares: list[Any] = [
         ModelCallLimitMiddleware(run_limit=8, exit_behavior="end"),
         ToolCallLimitMiddleware(tool_name="search_codebase", run_limit=4, exit_behavior="end"),
         get_summarization_middleware()

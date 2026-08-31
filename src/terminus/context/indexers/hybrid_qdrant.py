@@ -37,7 +37,7 @@ def get_or_create_qdrant_hybrid_index(repo_path: str)->QdrantVectorStore:
     existing = [c.name for c in client.get_collections().collections]
     if collection_name in existing:
         info = client.get_collection(collection_name=collection_name)
-        if info.points_count > 0:
+        if (info.points_count or 0) > 0:
             logger.info("Collection already exists with points. Skipping indexing")
             return QdrantVectorStore.from_existing_collection(
                 collection_name=collection_name,
@@ -95,8 +95,10 @@ def show_qdrant_hybrid_index(vector_store: QdrantVectorStore)->None:
     
     for i,point in enumerate(points):
         payload = point.payload
-        embedding = point.vector
         console.print(f"[bold cyan] Chunk {i+1}:[/bold cyan] {payload}")
+        if payload is None:
+            console.print("[yellow]No payload for this point, skipping.[/yellow]")
+            continue
         console.print(f"File: {payload['metadata']['source']}")
         console.print(f"Name: {payload['metadata']['name']}")
         console.print(f"Lines: {payload['metadata']['start_line']}-{payload['metadata']['end_line']}")
@@ -104,10 +106,22 @@ def show_qdrant_hybrid_index(vector_store: QdrantVectorStore)->None:
             f"\n[bold]Code:[/bold]\n"
             f"[code]{payload.get('page_content', '')[:300]}[/code]...\n"
         )
-        console.print(
-            f"[bold green]Embedding [{len(embedding)}]: "
-            f"{', '.join(f'{v:.4f}' for v in embedding[:5])} ..."
-        )
+
+        raw_vec = point.vector
+        if isinstance(raw_vec, dict):
+            dense = next((v for v in raw_vec.values() if isinstance(v, list) and v and isinstance(v[0], float)), None)
+            embedding: list[float] | None = dense  # type: ignore[assignment]
+        elif isinstance(raw_vec, list) and raw_vec and isinstance(raw_vec[0], list):
+            embedding = raw_vec[0]  
+        else:
+            embedding = raw_vec  # type: ignore[assignment]
+        if embedding is not None:
+            console.print(
+                f"[bold green]Embedding [{len(embedding)}]: "
+                f"{', '.join(f'{v:.4f}' for v in embedding[:5])} ..."
+            )
+        else:
+            console.print("[yellow]No embedding available for this point.[/yellow]")
         console.print("-" * 50)
     
     

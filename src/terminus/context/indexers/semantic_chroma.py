@@ -1,4 +1,3 @@
-
 from pathlib import Path
 from rich.console import Console
 import chromadb
@@ -71,7 +70,10 @@ def show_chroma_semantic_index(collection:chromadb.Collection)->None:
     console.print(f"[dim]Collection:[/dim] {collection.name}")
     console.print(f"[dim]Total Chunks:[/dim] {collection.count()}")
     results = collection.get(include=['documents','metadatas',"embeddings"])
-    for i,(doc, meta, emb) in enumerate(zip(results['documents'],results['metadatas'],results['embeddings'])):
+    docs = results['documents'] or []
+    metas = results['metadatas'] or []
+    embs = results['embeddings'] or []
+    for i,(doc, meta, emb) in enumerate(zip(docs, metas, embs)):
         console.print(f"Chunk {i+1}:\n")
         console.print(f"[bold green]Metadata:[/bold green] {meta}")
         console.print(f"[bold green]Content:[/bold green] {doc}")

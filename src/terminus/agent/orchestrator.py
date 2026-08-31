@@ -4,12 +4,12 @@ from terminus.observability.logging import get_logger
 
 logger = get_logger(__name__)
 
-def handle_query(question:str, thread_id:str=None)->str:
+async def handle_query(question:str, thread_id: str | None=None)->str:
     """ Handles the query and returns the response """
     logger.info(f"Handling query: {question}")
-    agent = build_agent()
+    agent = await build_agent()
     agent_config = {"configurable":{"thread_id":thread_id}}
-    response = agent.invoke(
+    response = await agent.ainvoke(
         {"messages": [{"role": "user", "content": question}]},
         config=agent_config
     )
