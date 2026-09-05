@@ -7,6 +7,7 @@ from terminus.tools.terminal_tools import run_in_directory,run_command
 from terminus.tools.codebase_tool import search_codebase
 from terminus.observability.logging import get_logger
 from langchain.agents import create_agent
+from terminus.skills.skill_tools import load_skill, build_skills_prompt
 from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
 from typing import Any
 
@@ -24,8 +25,10 @@ ALWAYS give a final text answer."""
 async def build_agent():
     """ Create and return a langchain agent"""
     llm = get_llm()
+    skills_prompt = build_skills_prompt()
+    full_prompt = SYSTEM_PROMPT + "\n" + "==skills\n" +skills_prompt
     mcp_tools= await get_terminus_mcp_tools()
-    tools = [search_codebase,read_file, write_file,delete_file,list_directory,file_exists,append_file,run_in_directory,run_command,*mcp_tools]
+    tools = [search_codebase,read_file, write_file,delete_file,list_directory,file_exists,append_file,run_in_directory,run_command,*mcp_tools,load_skill]
     logger.info("Creating agent")
     checkpointer = await get_checkpointer()
     middlewares: list[Any] = [
@@ -36,7 +39,7 @@ async def build_agent():
     return create_agent(
         llm,
         tools=tools,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=full_prompt,
         checkpointer=checkpointer,
         middleware=middlewares
     )

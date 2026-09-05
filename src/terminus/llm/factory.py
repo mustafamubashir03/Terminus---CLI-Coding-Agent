@@ -21,7 +21,7 @@ def get_llm():
         return ChatFireworks(
             model=f"accounts/fireworks/models/{model}",
             temperature=0,
-            timeout=None
+            timeout=600
         )
     
     elif provider.lower() == "openai":

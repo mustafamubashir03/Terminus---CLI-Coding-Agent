@@ -3,7 +3,7 @@ llm:
   model: kimi-k3
 
 memory:
-  db_path: .memory/terminus.db
+  db_path: .terminus/memory/terminus.db
   summarize_at_tokens: 4000
   max_messages: 20
 
@@ -22,9 +22,12 @@ embeddings:
   model: sentence-transformers/all-MiniLM-L6-v2
 
 chromadb:
-  persist_dir: .chromadb/
+  persist_dir: .terminus/chromadb/
   collection_name: terminus
+
+skills:
+  skills_dir: .terminus/skills
 
 elasticsearch:
   url: "http://localhost:9200"
-  index_name: terminus
+  index_name: .terminus/elasticsearch
