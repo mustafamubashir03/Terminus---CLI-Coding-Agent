@@ -1,3 +1,4 @@
+from locale import str
 import os
 import re
 import json
@@ -11,6 +12,7 @@ _CONFIG_PATH = Path.cwd() / "terminus_mcp_servers.json"
 
 def load_terminus_mcp_config() -> dict:
     """Return MCP server config from the current project."""
+    os.environ.setdefault("CWD",str(Path.cwd()))
 
     if not _CONFIG_PATH.exists():
         return {}

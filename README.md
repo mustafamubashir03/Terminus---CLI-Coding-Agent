@@ -22,6 +22,25 @@ Terminus is a CLI tool that lets you ask natural-language questions about a code
   - Cerebras (`CEREBRAS_API_KEY`)
   - Anthropic (`ANTHROPIC_API_KEY`)
 - **Call-budget middleware** — `ModelCallLimitMiddleware` and `ToolCallLimitMiddleware` cap how many model calls and `search_codebase` calls a single query can consume, so a query fails fast instead of looping indefinitely.
+- **Model Context Protocol (MCP) Integration** — seamlessly connects to local or remote MCP servers (via `terminus_mcp_servers.json`) to dynamically equip the agent with advanced tools (e.g., filesystem operations, GitHub interactions).
+- **Goal-Focused Skills System** — allows for manual ingestion of task-specific instructions ("skills") that guide the agent on how to handle specialized domains.
+
+## Advanced Capabilities
+
+### Model Context Protocol (MCP) Integration
+
+Terminus integrates with external Model Context Protocol (MCP) servers to vastly expand its toolset. MCP connections are defined in a `terminus_mcp_servers.json` file. For example, an MCP server can provide advanced filesystem access or GitHub integrations via `stdio` transport. Terminus dynamically connects to these servers at runtime, fetches their available tools, and seamlessly provides them to the LangChain agent.
+
+### Task-Specific Skills System
+
+To make the agent more goal-focused and context-aware, Terminus supports manual ingestion of "skills". 
+
+Here is how the skills ingestion is done manually for understanding purposes:
+1. **Directory Structure:** Skills are placed in a specific directory (e.g., `.terminus/skills/`). Each skill gets its own folder (like `frontend-design`).
+2. **SKILL.md File:** Inside each folder is a `SKILL.md` file that defines the skill.
+3. **Metadata (Frontmatter):** The file starts with a YAML frontmatter block containing metadata such as `name`, `description`, and `when_to_use`.
+4. **Body (Instructions):** Below the frontmatter are the actual markdown instructions, guidelines, and context that the LLM should follow for that specific task.
+5. **Dynamic Loading:** At startup, the `SkillRegistry` parses these `SKILL.md` files. It extracts the metadata and appends a summary of available skills to the agent's system prompt. When the agent recognizes that a user's request aligns with a skill, it calls the `load_skill` tool to retrieve the full body instructions and execute the task accordingly.
 
 ## Architecture
 
