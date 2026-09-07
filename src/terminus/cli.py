@@ -72,6 +72,18 @@ async def terminus_cli_run():
         elif user_input.startswith("/show_semantic_index"):
             console.print("[bold green]Showing semantic index...[/bold green]")
             show_index(index)
+        elif user_input.startswith("/plan"):
+            goal = query.removeprefix("/plan ").strip()
+            if not goal:
+                console.print("[bold red]Please enter a goal[/bold red]")
+                continue
+            console.print(f"[bold green]Goal:[/bold green] {goal}")
+            logger.info(f"User asked for a plan for the goal: {goal}")
+            response = await handle_plan_command(goal)
+            console.print(f"[bold blue]Response:[/bold blue] {response}")
+        elif user_input.startswith("/task_status"):
+            show_task_status()
+            console.print(f"[bold blue]Response:[/bold blue] {response}")
         elif user_input.startswith("/help"):
             console.print("[bold green]Help:[/bold green]")
             console.print("\n[bold green]Commands:[/bold green]")

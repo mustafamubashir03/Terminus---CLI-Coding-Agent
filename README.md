@@ -44,7 +44,19 @@ Here is how the skills ingestion is done manually for understanding purposes:
 
 ## Architecture
 
-```
+Terminus is designed with a layered architecture, allowing it to use hybrid, lexical, or only semantic retrieval based on configuration. 
+
+### Core Architectural Layers
+- **Context Layer:** Includes the retrieval and indexing layer of the codebase, the memory layer, and some system prompts. The chunking strategy is done using LST via a library, because code is simply different than text. 
+- **Agent Orchestrator:** The `query_handler` from the Orchestrator manages queries, handles building agents, and passes tools and queries to them. The default agents are ReAct-agents (which means they are constantly in a reasoning-act loop until they deem it well). The agent ideally has access to all codebase and tools to perform tasks.
+- **Tooling & Skills:** MCP tools are used wherever possible for much more efficient performance of tasks. Ideally, skills could be added in the end-user project, injected directly by Terminus scripts, and loaded as tools for the agent to use whenever required.
+- **Memory Layer:** Memory has been implemented using the checkpointer of LangGraph (e.g., maintaining `threadId`).
+- **Observability Layer:** Currently handled by LangSmith itself, with potential exploration of Langfuse.
+- **Security Layer:** Guardrails and Human-In-The-Loop (HITL) workflows would be used.
+- **Determinism:** Pydantic Structured Outputs are used wherever determinism is required.
+- **Tasks Layer (Planned):** Moving from here, the Tasks layer would be implemented to achieve a long-running deep-agents orchestrator. The orchestrator will make sure to solve tasks via agents in a sorted directed graph fashion so independent tasks could run parallelly and dependent ones would wait for their parent dependency to resolve first.
+
+```text
 terminus/
 ├── cli.py                     # REPL entry point (/ask, /clear, /help, /show_semantic_index)
 ├── config.py                  # loads config.yaml into CONFIG
@@ -63,15 +75,61 @@ terminus/
     └── logging.py              # structured logging
 ```
 
+### System Flow
+
+```mermaid
+graph TD
+    Start([Terminus Launch]) --> CheckMemory{Has Existing<br/>Info/Memory?}
+    CheckMemory -- Yes --> LoadMem[Load threadId & memory<br/>via LangGraph checkpointer]
+    CheckMemory -- No --> InitQuery[Orchestrator:<br/>query_handler]
+    LoadMem --> InitQuery
+
+    InitQuery --> BuildAgent[Build ReAct-Agent &<br/>Pass Tools & Query]
+    BuildAgent --> AgentLoop((ReAct Loop))
+
+    subgraph Agent Context
+        CodeBase[(Codebase Access)]
+        Tools[MCP Tools & Injected Skills]
+        StructOut[Pydantic Structured Outputs]
+    end
+
+    AgentLoop <--> CodeBase
+    AgentLoop <--> Tools
+    AgentLoop <--> StructOut
+
+    subgraph Context Layer
+        Retrieve[Retrieval: Hybrid / Lexical / Semantic]
+        Chunking[LST Chunking Strategy]
+        SysPrompts[System Prompts]
+    end
+
+    AgentLoop <--> Retrieve
+    Retrieve -.-> Chunking
+    
+    subgraph Observability & Security
+        Obs[LangSmith / Langfuse]
+        Sec[Guardrails & HITL]
+    end
+
+    AgentLoop -.-> Obs
+    AgentLoop -.-> Sec
+
+    subgraph Future: Tasks Layer
+        DAG[Sorted Directed Graph Tasks]
+        Parallel[Independent Tasks Run Parallely]
+        Wait[Dependent Tasks Wait for Parent]
+        DAG --> Parallel
+        DAG --> Wait
+    end
+```
+
 **Request flow:**
 
-1. User types `/ask <question>` in the CLI.
-2. `cli.py` strips the command prefix and calls `handle_query(question)`.
-3. `orchestrator.py` builds the agent on first call (cached thereafter) and invokes it with the question, under a `recursion_limit`.
-4. The agent (LangChain `create_agent`) decides whether to call `search_codebase`.
-5. `search_codebase` embeds the query, retrieves the top-k nearest chunks from Chroma, and returns them formatted with file path, line range, type, and name.
-6. The agent reads the results and produces a final answer, or calls the tool again — bounded by `ToolCallLimitMiddleware` and `ModelCallLimitMiddleware`.
-7. The CLI prints the response.
+1. **Launch:** Terminus will launch up with all existing info if it had done earlier, such as current `threadId` or any memory-related stuff.
+2. **Orchestration:** Otherwise, the query will be managed by `query_handler` from Orchestrator, which handles building agents and passing tools and the query to it.
+3. **Execution:** The agent (a ReAct-agent in a reasoning-act loop) utilizes available tools, injected skills, and full codebase access to perform the task.
+4. **Context Retrieval:** Information is retrieved via configurable layers (hybrid, lexical, semantic) backed by LST-chunked data.
+5. **Completion:** The loop continues until the agent deems the task well-resolved, bounded by budgets, outputting results deterministically via Pydantic where required.
 
 ## Configuration
 
