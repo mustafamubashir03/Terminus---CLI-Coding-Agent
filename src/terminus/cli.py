@@ -1,4 +1,4 @@
-from terminus.mcp.terminus_mcp_client import get_terminus_mcp_tools
+from terminus.tasks.orchestrator import handle_plan_command
 import asyncio
 from terminus.memory.session import switch_session,get_current_session
 import uuid
@@ -13,6 +13,26 @@ from terminus.observability.logging import get_logger
 
 console = Console()
 logger = get_logger(__name__)
+
+def show_task_status():
+    """Display the current task progress for the latest approved project."""
+    from terminus.config import CONFIG
+    from terminus.tasks.task_store import TaskStore
+    db_path = CONFIG.get("tasks", {}).get("db_path", ".terminus/tasks/tasks.db")
+    store = TaskStore(db_path)
+    project_id = store.get_latest_project()
+    if not project_id:
+        console.print("[bold yellow]No active project found.[/bold yellow]")
+        return
+    progress = store.get_progress(project_id)
+    console.print("[bold green]Task Status:[/bold green]")
+    for state, count in progress.items():
+        console.print(f"{state.capitalize()}: {count}")
+    tasks = store._get_all_tasks(project_id)
+    if tasks:
+        console.print("[bold cyan]Tasks Overview:[/bold cyan]")
+        for t in tasks:
+            console.print(f"- {t['id']}: {t['description']} ({t['status']})")
 
 def initialize():
     logger.info("Initializing Terminus...")
@@ -67,8 +87,12 @@ async def terminus_cli_run():
                 console.print("[bold red]Please enter a question[/bold red]")
                 continue
             console.print(f"[bold green]Question:[/bold green] {question}")
-            response = await handle_query(question,session_id)
-            console.print(f"[bold blue]Response:[/bold blue] {response}")
+            try:
+                response = await handle_query(question, session_id)
+                console.print(f"[bold blue]Response:[/bold blue] {response}")
+            except Exception as e:
+                logger.error(f"Query failed: {e}")
+                console.print(f"[bold red]Query failed:[/bold red] {e}")
         elif user_input.startswith("/show_semantic_index"):
             console.print("[bold green]Showing semantic index...[/bold green]")
             show_index(index)
@@ -83,11 +107,14 @@ async def terminus_cli_run():
             console.print(f"[bold blue]Response:[/bold blue] {response}")
         elif user_input.startswith("/task_status"):
             show_task_status()
-            console.print(f"[bold blue]Response:[/bold blue] {response}")
+
         elif user_input.startswith("/help"):
             console.print("[bold green]Help:[/bold green]")
             console.print("\n[bold green]Commands:[/bold green]")
             console.print("[yellow] /ask <question> - Ask a question about codebase[/yellow]")
+            console.print("[yellow] /plan <goal> - Create a new plan for the goal[/yellow]")
+            console.print("[yellow] /plan continue - Resume the latest resumable project[/yellow]")
+            console.print("[yellow] /task_status - Show task status[/yellow]")
             console.print("[yellow] /clear - Clear the screen[/yellow]")
             console.print("[yellow] /exit - Exit the CLI[/yellow]")
             console.print("[yellow] /quit - Exit the CLI[/yellow]")
