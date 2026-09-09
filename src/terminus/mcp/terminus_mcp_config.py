@@ -1,4 +1,3 @@
-from locale import str
 import os
 import re
 import json
@@ -20,9 +19,9 @@ def load_terminus_mcp_config() -> dict:
     raw = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
 
     resolved = re.sub(
-        r"\$\{(\w+)\}",
-        lambda m: os.getenv(m.group(1), ""),
-        json.dumps(raw),
+    r"\$\{(\w+)\}",
+    lambda m: json.dumps(os.getenv(m.group(1), ""))[1:-1],
+    json.dumps(raw),
     )
 
     return json.loads(resolved).get("mcp_servers", {})

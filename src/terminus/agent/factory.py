@@ -2,11 +2,11 @@ from terminus.mcp.terminus_mcp_client import get_terminus_mcp_tools
 from terminus.memory.short_term import get_summarization_middleware
 from terminus.memory.short_term import get_checkpointer
 from terminus.llm.factory import get_llm
-from terminus.tools.filesystem_tools import read_file,write_file,delete_file,list_directory,file_exists,append_file
-from terminus.tools.terminal_tools import run_in_directory,run_command
 from terminus.tools.codebase_tool import search_codebase
+from terminus.tools.terminal_tools import run_in_directory,run_command
 from terminus.observability.logging import get_logger
 from langchain.agents import create_agent
+from terminus.tools.filesystem_tools import list_directory,read_file,write_file,delete_file,file_exists,append_file
 from terminus.skills.skill_tools import load_skill, build_skills_prompt
 from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
 from typing import Any
@@ -28,7 +28,7 @@ async def build_agent():
     skills_prompt = build_skills_prompt()
     full_prompt = SYSTEM_PROMPT + "\n" + "==skills\n" +skills_prompt
     mcp_tools= await get_terminus_mcp_tools()
-    tools = [search_codebase,read_file, write_file,delete_file,list_directory,file_exists,append_file,run_in_directory,run_command,*mcp_tools,load_skill]
+    tools = [search_codebase,list_directory,read_file,write_file,delete_file,file_exists,append_file,*mcp_tools,run_in_directory,run_command,load_skill]
     logger.info("Creating agent")
     checkpointer = await get_checkpointer()
     middlewares: list[Any] = [

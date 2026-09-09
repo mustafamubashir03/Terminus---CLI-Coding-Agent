@@ -4,20 +4,6 @@ from rich.table import Table
 
 console = Console()
 
-def _render_plan(plan : ExecutionPlan):
-    """ Render the plan as a Rich table """
-    table = Table(title="Execution Plan")
-    table.add_column("ID", style="dim", width=10)
-    table.add_column("Description")
-    table.add_column("Status", justify="right")
-    
-    for task in plan.tasks:
-        table.add_row(
-            task.id,
-            task.description,
-            task.status
-        )
-    console.print(table)
 
 
 def present_plan_for_approval(plan : ExecutionPlan)->ExecutionPlan | None:
@@ -35,7 +21,6 @@ def present_plan_for_approval(plan : ExecutionPlan)->ExecutionPlan | None:
         if choice == "A":
             return plan
         elif choice == "M":
-            # TODO: implement modify
             task_id = input("Enter task ID to modify: ").strip()
             task = next((
                 t 
@@ -50,11 +35,28 @@ def present_plan_for_approval(plan : ExecutionPlan)->ExecutionPlan | None:
             if new_task_description:
                 task.description = new_task_description
             console.print("Task updated.")
-            
-            pass
         elif choice == "R":
             return None
         else:
             console.print("[yellow]Invalid choice. Please try again.[/yellow]")
             
         
+def _render_plan(plan : ExecutionPlan):
+    """ Render the plan as a Rich table """
+    console.print(f"[bold cyan]Plan: {plan.project_name}")
+    console.print(f"[cyan]Goal: {plan.goal_summary}")
+    console.print(f"[cyan]Tech Stack: {plan.tech_stack}")
+    console.print(f"[cyan]Risks: {plan.risks}")
+    console.print(f"[cyan]Assumptions: {plan.assumptions}")
+    table = Table(title="Execution Plan")
+    table.add_column("ID", style="dim", width=10)
+    table.add_column("Description")
+    table.add_column("Type", justify="right")
+    
+    for task in plan.tasks:
+        table.add_row(
+            task.id,
+            task.description,
+            task.task_type.value
+        )
+    console.print(table)

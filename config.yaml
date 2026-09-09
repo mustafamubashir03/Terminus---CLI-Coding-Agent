@@ -2,6 +2,7 @@ llm:
   provider: fireworks
   model: kimi-k3
   judge_model: kimi-k3
+  planner_model: glm-5p3-flash
 
 memory:
   db_path: .terminus/memory/terminus.db

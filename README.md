@@ -54,7 +54,7 @@ Terminus is designed with a layered architecture, allowing it to use hybrid, lex
 - **Observability Layer:** Currently handled by LangSmith itself, with potential exploration of Langfuse.
 - **Security Layer:** Guardrails and Human-In-The-Loop (HITL) workflows would be used.
 - **Determinism:** Pydantic Structured Outputs are used wherever determinism is required.
-- **Tasks Layer (Planned):** Moving from here, the Tasks layer would be implemented to achieve a long-running deep-agents orchestrator. The orchestrator will make sure to solve tasks via agents in a sorted directed graph fashion so independent tasks could run parallelly and dependent ones would wait for their parent dependency to resolve first.
+- **Tasks Layer Orchestration:** A long-running deep-agents orchestrator (`orchestrator.py`) handles execution. It starts with a planning phase where an agent (`planner.py`) creates a comprehensive execution plan. This plan is sent to the user via a Human-In-The-Loop (HITL) system (`approval.py`) for review and modification. Once approved, the orchestrator persists the tasks in a SQL-based `task_store` under a `project_id`. The orchestrator's `while` loop then solves tasks via agents in a sorted directed graph (DAG) fashion—claiming them one by one in the executor. Independent tasks run in parallel, while dependent tasks wait for their parent dependency results before being sent to `run_subtask_agent`. Finally, each completed task is evaluated by an LLM as a judge for a final verdict on success.
 
 ```text
 terminus/
@@ -114,13 +114,23 @@ graph TD
     AgentLoop -.-> Obs
     AgentLoop -.-> Sec
 
-    subgraph Future: Tasks Layer
-        DAG[Sorted Directed Graph Tasks]
-        Parallel[Independent Tasks Run Parallely]
-        Wait[Dependent Tasks Wait for Parent]
-        DAG --> Parallel
-        DAG --> Wait
+    subgraph Tasks Layer Orchestration
+        Plan[Planning Agent<br/>planner.py]
+        HITL[Human Approval<br/>approval.py]
+        SQLStore[(SQL Task Store<br/>task_store.py)]
+        ExecLoop((Orchestrator<br/>while loop))
+        SubTask[run_subtask_agent]
+        LLMJudge[LLM Judge Evaluation]
+
+        Plan --> HITL
+        HITL -- Approved --> SQLStore
+        SQLStore --> ExecLoop
+        ExecLoop -- Claim Task --> SubTask
+        SubTask --> LLMJudge
+        LLMJudge -- Verdict/State --> SQLStore
     end
+    
+    InitQuery -.-> Plan
 ```
 
 **Request flow:**
@@ -129,7 +139,9 @@ graph TD
 2. **Orchestration:** Otherwise, the query will be managed by `query_handler` from Orchestrator, which handles building agents and passing tools and the query to it.
 3. **Execution:** The agent (a ReAct-agent in a reasoning-act loop) utilizes available tools, injected skills, and full codebase access to perform the task.
 4. **Context Retrieval:** Information is retrieved via configurable layers (hybrid, lexical, semantic) backed by LST-chunked data.
-5. **Completion:** The loop continues until the agent deems the task well-resolved, bounded by budgets, outputting results deterministically via Pydantic where required.
+5. **Planning & Approval:** For larger workflows, a planning agent creates an execution plan, which is presented to the user for approval or modification (HITL).
+6. **Task Orchestration:** Approved plans are stored as a project in a persistent SQL `task_store`. An orchestrator `while` loop manages state, claiming ready tasks in a DAG order (resolving dependencies first).
+7. **Execution & Evaluation:** Each task is sent to `run_subtask_agent`. Upon returning, an LLM judge evaluates the result. The task store is updated, and the orchestrator continues until all project tasks are completed.
 
 ## Configuration
 
