@@ -1,5 +1,4 @@
 from __future__ import annotations
-import re
 from pathlib import Path
 
 from terminus.observability.logging import get_logger
@@ -13,40 +12,21 @@ class SkillNotFoundError(Exception):
     pass
 
 class SkillRegistry:
-    """ 
-    Owns the in-memory catalog of all skills found in skills_dir.
-    
-    Expected layout on disk:
-    skills_dir/
-        python_debug/
-            SKILL.md - required -- frontmatter + instructions
-            scripts/ - optional - executable helpers
-            templates/ - optional -- output templates
-            resources/ - optional -- reference docs
-        write_tests/
-            SKILL.md
-            templates/
-                pytest_template.py
+    """
+    The in-memory catalog of skills found under ``skills_dir``.
 
+    On-disk layout, one directory per skill::
 
-    After calling load(), the internal _skills dict looks like:
-      {
-        "python_debug":{
-            "meta": {"name":"python_debug","description":"...",....}
-            "body": "You are an expert Python debugger. Follow these steps...",
-            "skills_dir":Path(".terminus/skills/python_debug") 
-            },
-            "write_tests":{           
-                "meta": {"name":"write_tests","description":"...",....},
-                "body": "Generate pytest unit tests...",
-                "skills_dir":Path(".terminus/skills/write_tests") 
-                }
-      
-      }
+        <skills_dir>/<name>/SKILL.md     required - YAML frontmatter + body
+        <skills_dir>/<name>/scripts/      optional - executable helpers
+        <skills_dir>/<name>/templates/   optional - output templates
 
-      "meta" is parsed from the YAML frontmatter block (name, description, when_to_use ,).
-      "body" is everything after the frontmatter - the actual instructions sent to the LLM.
-      "skill_dir" is kept so we can later discover support files inside that folder.
+    ``self.skills`` maps the skill's frontmatter ``name`` to::
+
+        {"meta": {...frontmatter...}, "body": "instructions", "skills_dir": Path}
+
+    ``meta`` is parsed from the frontmatter (name, description, when_to_use);
+    ``body`` is everything after it and is what the model receives.
     """
     def __init__(self,skills_dir:Path = Path(".terminus/skills"))->None:
         self.skills_dir = skills_dir
@@ -74,7 +54,8 @@ class SkillRegistry:
                 meta, body = self._parse_skill_markdown(skill_file)
                 name = meta.get("name", skill_dir.name)
                 if not meta.get("when_to_use"):
-                    logger.warning(f"Skill {name} has no when_to_use field")
+                    # when_to_use is OPTIONAL: build_skills_prompt() skips it when absent.
+                    logger.debug(f"Skill {name} has no when_to_use field (optional, skipping)")
                 self.skills[name] = {
                     "meta": meta,
                     "body": body,
@@ -106,9 +87,6 @@ class SkillRegistry:
 
         lines.append(
             "\n When the user's request matches a skill, call load_skill(name) to load the skill"
-        )
-        lines.append(
-            "\n Always call get_all_skills() at the start to refresh the list"
         )
         return "\n".join(lines)
 
@@ -153,14 +131,6 @@ class SkillRegistry:
             )
         return result
 
-    @property
-    def skill_names(self):
-        return list(self.skills.keys())
-
-
-
-
-
     def _parse_skill_markdown(self,skill_file:Path)->tuple[dict,str]:
         """
         Parse a skill markdown file and return the metadata and body
@@ -194,15 +164,4 @@ class SkillRegistry:
         for item in skill_dir.rglob("*"):
             if item.is_file() and item != skill_dir / SKILL_FILENAME:
                 support_files.append(item)
-        return support_files    
-
-    def get_all_skills(self)->list[dict]:
-        """Get all skills"""
-        return list(self.skills.values())
-    
-                
-
-
-
-    
-        
+        return support_files

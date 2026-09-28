@@ -1,3 +1,4 @@
+from terminus.agent.factory import human_is_present
 from terminus.tasks.planner import ExecutionPlan
 from rich.console import Console
 from rich.table import Table
@@ -7,14 +8,27 @@ console = Console()
 
 
 def present_plan_for_approval(plan : ExecutionPlan)->ExecutionPlan | None:
-    """ 
+    """
     Render the plan as a Rich table and prompt the user to :
     [A] Approve - returns the plan as-is
     [M] Modify - edit a task description in-place and re-render
     [R] Reject - returns None so the caller re-plans with feedback
 
     Loop continues until the user approves or rejects.
+
+    Without an interactive terminal there is nobody to ask, and ``input()`` would
+    block forever on a pipe or in CI. In that case the plan is not approved:
+    returning None means rejected, which is the safe default - a plan must never
+    start executing because a prompt was answered by an empty pipe.
     """
+    if not human_is_present():
+        console.print(
+            "[bold red]No interactive terminal available to approve the plan.[/bold red]\n"
+            f"  {len(plan.tasks)} task(s) were planned but will NOT be executed.\n"
+            "Run Terminus interactively to review and approve a plan."
+        )
+        return None
+
     while True:
         _render_plan(plan)
         choice = input("[A] Approve | [M] Modify | [R] Reject: ").strip().upper()

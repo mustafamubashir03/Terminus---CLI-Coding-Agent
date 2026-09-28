@@ -1,8 +1,30 @@
 llm:
-  provider: fireworks
-  model: kimi-k3
-  judge_model: kimi-k3
-  planner_model: glm-5p3-flash
+  provider: openrouter
+  model: poolside/laguna-s-2.1:free
+  judge_model: poolside/laguna-s-2.1:free
+  planner_model: poolside/laguna-s-2.1:free
+  reasoning:
+    effort: low
+    exclude: false
+  include_reasoning: true
+  # true => the provider request is streamed internally, so ainvoke() emits
+  # per-token on_llm_new_token callbacks. LangGraph's `messages` stream mode
+  # turns those into the incremental chunks the /ask REPL prints. With false,
+  # langchain-core skips its _astream branch and ainvoke() returns one block
+  # only after the whole response is generated (no live output).
+  streaming: true
+  fallbacks:
+    - provider: google_genai
+      model: gemini-3.5-flash-lite
+    - provider: cohere
+      model: command-r-plus-08-2024
+  route_max_attempts: 2
+  route_backoff_seconds: 5
+  # Per-attempt HTTP/socket timeout for a single LLM request, and max_retries
+  # (retries AFTER the initial attempt, tenacity exponential backoff 4s->10s).
+  # Worst-case wait for one LLM call = request_timeout_seconds * (max_retries + 1).
+  request_timeout_seconds: 300
+  max_retries: 0
 
 memory:
   db_path: .terminus/memory/terminus.db
@@ -11,6 +33,25 @@ memory:
 
 tasks:
   db_path: .terminus/tasks/tasks.db
+  # Timeout bounds (seconds) so hung external operations become task failures.
+  # max_retries per task is 3 total attempts; /plan continue grants one fresh run.
+  # agent_timeout_seconds bounds the WHOLE task agent loop; judge bounds the
+  # judge agent. Per-attempt LLM timeouts live under llm.request_timeout_seconds.
+  agent_timeout_seconds: 900
+  judge_timeout_seconds: 300
+  mcp_timeout_seconds: 120
+  planner_timeout_seconds: 300
+  rate_limit_backoff_seconds: 60
+  index_timeout_seconds: 300
+  # How many tasks may execute at the same time within one /plan run.
+  # 1 (the default) is fully serial. Raise it to 2-4 to run independent tasks
+  # concurrently; tasks still respect their dependencies, so a task never
+  # starts before everything it depends on has COMPLETED.
+  #
+  # Concurrent tasks that mutate the same project are still serialised per
+  # workspace: a writer waits its turn, while read-only work is never blocked.
+  # Clamped to terminus.tasks.orchestrator.MAX_CONCURRENT_TASKS (4).
+  max_concurrent: 1
 
 rag:
   mode: hybrid
@@ -18,9 +59,11 @@ rag:
 vector_store:
   provider: qdrant
   retrieval_mode: hybrid
+  fallback_to_chroma: true
 
 qdrant:
   collection_name: terminus_hybrid
+  timeout_seconds: 5
 
 embeddings:
   provider: huggingface
@@ -33,6 +76,9 @@ chromadb:
 skills:
   skills_dir: .terminus/skills
 
-elasticsearch:
-  url: "http://localhost:9200"
-  index_name: .terminus/elasticsearch
+index:
+  # Manifest of last-indexed file state; enables incremental re-indexing.
+  manifest_path: .terminus/index/manifest.json
+  # Files larger than this (bytes) are hashed only up to the cap to keep
+  # startup fast in repos with large generated files.  Default 1 MiB.
+  max_file_size: 1048576

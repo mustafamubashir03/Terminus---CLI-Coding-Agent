@@ -7,12 +7,12 @@ def get_retriever():
     vector_store = CONFIG["vector_store"]["provider"]
     mode = CONFIG["rag"]["mode"]
     logger.info(f"Using vector store: {vector_store} with mode: {mode}")
-    if vector_store == "chroma":
+    if vector_store in {"chroma", "chromadb"}:
         if mode == "semantic":
             from .semantic_chroma import retrieve
             return retrieve
         else:
-            raise ValueError(f"Hybrid mode is only supported for qdrant")
+            raise ValueError("Hybrid mode is only supported for qdrant")
     elif vector_store == "qdrant":
         if mode == "semantic":
             from .semantic_qdrant import retrieve

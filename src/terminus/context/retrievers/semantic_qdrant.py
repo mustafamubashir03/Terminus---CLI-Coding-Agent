@@ -1,5 +1,4 @@
 from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
 from terminus.config import CONFIG
 from terminus.llm.factory import get_embedder
 from terminus.observability.logging import get_logger
@@ -7,19 +6,6 @@ import os
 
 logger = get_logger(__name__)
 
-_collection_cache = None
-
-def _get_collection():
-    """Returns a cached ChromaDB collection, opening it only once per process."""
-    global _collection_cache
-    if _collection_cache is None:
-        cluster_endpoint = os.getenv("CLUSTER_ENDPOINT")
-        api_key = os.getenv("QDRANT_API_KEY")
-        collection_name = CONFIG["qdrant"]["collection_name"]
-        client = QdrantClient(url=cluster_endpoint, api_key=api_key)
-        _collection_cache = client.get_collection(collection_name=collection_name)
-        logger.info("Qdrant collection opened and cached")
-    return _collection_cache
 
 def retrieve(query: str, k: int = 5) -> list[dict]:
     """ Embed the query and finds k most similar chunks"""

@@ -10,24 +10,64 @@ from terminus.observability.logging import get_logger
 logger = get_logger(__name__)
 console = Console()
 
-def get_or_create_chroma_index(repo_path: str)->chromadb.Collection:
-    chroma_client = chromadb.PersistentClient(path=CONFIG["chromadb"]["persist_dir"])
+
+def _repo_path(repo_path: str | Path) -> Path:
+    return Path(repo_path).expanduser().resolve()
+
+
+def _chroma_persist_path(repo_path: str | Path) -> Path:
+    configured = Path(CONFIG["chromadb"]["persist_dir"]).expanduser()
+    if configured.is_absolute():
+        return configured
+    return _repo_path(repo_path) / configured
+
+
+def get_or_create_chroma_index(repo_path: str, *, force_reindex: bool = False) -> chromadb.Collection:
+    """Create or load the ChromaDB index.
+
+    If the collection already has documents, an incremental freshness check is
+    performed and only changed/new files are re-indexed.  Pass
+    *force_reindex=True* to wipe and rebuild everything from scratch.
+    """
+    repo_path = str(_repo_path(repo_path))
+    persist_dir = str(_chroma_persist_path(repo_path))
+    chroma_client = chromadb.PersistentClient(path=persist_dir)
     collection = chroma_client.get_or_create_collection(
         name=CONFIG["chromadb"]["collection_name"]
     )
     if collection.count() > 0:
-        logger.info(f"Found existing index with {collection.count()} chunks.")
-        console.print(f"[dim]Loading existing index-{collection.count()} chunks [/dim]")
+        if force_reindex:
+            from terminus.context.indexers.reindexer import full_reindex
+
+            logger.info("Force reindex requested ΓÇö wiping and rebuilding")
+            return full_reindex(repo_path)[0]
+
+        from terminus.context.indexers.reindexer import incremental_reindex
+
+        _vs, result = incremental_reindex(repo_path)
+        if result.files_added or result.files_modified or result.files_deleted:
+            logger.info(f"Incremental reindex: {result}")
         return collection
-    repo_path = str(Path.cwd())
+
     logger.info(f"No existing index found. Initializing new index for {repo_path}")
     console.print(f"[yellow]No index found. Initializing new index for [/yellow]{repo_path}")
-    return index_codebase_chroma(repo_path)
+    result_coll = index_codebase_chroma(repo_path)
+
+    # Create manifest so next startup does incremental diff
+    from terminus.context.indexers.freshness import Manifest, _now_iso
+
+    manifest = Manifest(repo_path=repo_path, last_full_index=_now_iso())
+    manifest.files = Manifest.snapshot_directory(repo_path)
+    manifest.save()
+
+    return result_coll
 
 def index_codebase_chroma(repo_path: str)->chromadb.Collection:
     """Parse all python files and store their embeddings and docstrings in Chroma. Returns the ChromaDB collection """
     embedder = get_embedder()
-    chroma_client = chromadb.PersistentClient(path=CONFIG["chromadb"]["persist_dir"])
+    repo_path = str(_repo_path(repo_path))
+    persist_dir = str(_chroma_persist_path(repo_path))
+    chroma_client = chromadb.PersistentClient(path=persist_dir)
     collection = chroma_client.get_or_create_collection(
         name=CONFIG["chromadb"]["collection_name"]
     )

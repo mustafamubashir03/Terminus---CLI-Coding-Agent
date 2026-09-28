@@ -202,7 +202,7 @@ def _sliding_window(lines: list[str], filepath:str)-> list[ParsedChunk]:
 
 def get_source_files(repo_path:str, skips_dirs: list[str] | None = None)->list[str]:
     """Recursively  """
-    skip = set(skips_dirs or [".venv","venv", ".git", "__pycache__","node_modules","dist", "build", "target"])
+    skip = set(skips_dirs or [".venv","venv", ".git", "__pycache__","node_modules","dist", "build", "target", ".terminus"])
     files = [
         str(path) for path in Path(repo_path).rglob('*')
         if path.suffix.lower() in ALL_EXTENSION

@@ -1,0 +1,203 @@
+import asyncio
+import os
+from copy import deepcopy
+
+import pytest
+
+from terminus import cli
+from terminus.config import CONFIG, DEFAULT_CONFIG
+from terminus.context.indexers import factory as indexer_factory
+from terminus.context.indexers.errors import VectorStoreUnavailableError
+from terminus.context.indexers import semantic_chroma
+from terminus.context.indexers import hybrid_qdrant
+from terminus.context.indexers import freshness
+from terminus.env import find_project_env, load_project_env
+
+
+def test_find_project_env_searches_parent_directories(tmp_path):
+    env_file = tmp_path / ".env"
+    nested = tmp_path / "repo" / "nested"
+    nested.mkdir(parents=True)
+    env_file.write_text("TERMINUS_TEST_VALUE=file\n", encoding="utf-8")
+
+    assert find_project_env(nested) == env_file.resolve()
+    assert load_project_env(nested) == env_file.resolve()
+
+
+def test_explicit_env_file_takes_precedence(tmp_path, monkeypatch):
+    ancestor = tmp_path / ".env"
+    explicit = tmp_path / "custom.env"
+    nested = tmp_path / "repo"
+    nested.mkdir()
+    ancestor.write_text("TERMINUS_TEST_VALUE=ancestor\n", encoding="utf-8")
+    explicit.write_text("TERMINUS_TEST_VALUE=explicit\n", encoding="utf-8")
+    monkeypatch.setenv("TERMINUS_ENV_FILE", str(explicit))
+
+    assert find_project_env(nested) == explicit.resolve()
+
+
+def test_load_project_env_does_not_override_process_environment(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text("TERMINUS_TEST_VALUE=file\n", encoding="utf-8")
+    monkeypatch.setenv("TERMINUS_TEST_VALUE", "process")
+
+    load_project_env(tmp_path)
+
+    assert os.environ["TERMINUS_TEST_VALUE"] == "process"
+
+
+def test_initialize_allows_missing_local_env(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "load_project_env", lambda path: None)
+    llm = object()
+    embedder = object()
+    index = object()
+    monkeypatch.setattr(cli, "get_llm", lambda: llm)
+    monkeypatch.setattr(cli, "format_provider_diagnostics", lambda: "diagnostics")
+    monkeypatch.setattr(cli, "get_embedder", lambda: embedder)
+    monkeypatch.setattr(cli, "get_or_create_indexer", lambda path: index)
+
+    assert cli.initialize() == (llm, embedder, index)
+
+
+def test_cli_reports_startup_error_without_traceback(monkeypatch, capsys):
+    def fail_startup():
+        raise ValueError("OPENROUTER_API_KEY is not set")
+
+    async def no_shutdown():
+        return None
+
+    monkeypatch.setattr(cli, "initialize", fail_startup)
+    monkeypatch.setattr(cli, "shutdown_resources", no_shutdown)
+
+    result = asyncio.run(cli.terminus_cli_run())
+
+    output = capsys.readouterr().out
+    assert result is False
+    assert "Startup failed:" in output
+    assert "OPENROUTER_API_KEY is not set" in output
+    assert "Traceback" not in output
+
+
+def test_default_indexer_is_local_chroma():
+    assert DEFAULT_CONFIG["vector_store"]["provider"] == "chromadb"
+    assert DEFAULT_CONFIG["rag"]["mode"] == "semantic"
+    assert DEFAULT_CONFIG["vector_store"]["fallback_to_chroma"] is True
+
+
+def test_qdrant_transport_failure_uses_repository_local_chroma(monkeypatch, tmp_path):
+    saved = deepcopy(CONFIG)
+    monkeypatch.setenv("QDRANT_API_KEY", "test-key")
+    monkeypatch.setenv("CLUSTER_ENDPOINT", "https://qdrant.example")
+    monkeypatch.setitem(CONFIG["rag"], "mode", "hybrid")
+    monkeypatch.setitem(CONFIG["vector_store"], "provider", "qdrant")
+    monkeypatch.setitem(CONFIG["vector_store"], "retrieval_mode", "hybrid")
+    monkeypatch.setitem(CONFIG["qdrant"], "collection_name", "test-collection")
+    monkeypatch.setitem(CONFIG["vector_store"], "fallback_to_chroma", True)
+    sentinel = object()
+
+    def fail_qdrant(*args, **kwargs):
+        raise ConnectionResetError("connection reset by peer")
+
+    monkeypatch.setattr(indexer_factory, "_create_indexer", fail_qdrant)
+    monkeypatch.setattr(
+        semantic_chroma, "get_or_create_chroma_index", lambda path: sentinel
+    )
+
+    try:
+        result = indexer_factory.get_or_create_indexer(str(tmp_path))
+        assert result is sentinel
+        assert CONFIG["vector_store"]["provider"] == "chromadb"
+        assert CONFIG["rag"]["mode"] == "semantic"
+        assert CONFIG["_runtime"]["indexer_fallback"]["from_provider"] == "qdrant"
+    finally:
+        CONFIG.clear()
+        CONFIG.update(saved)
+
+
+def test_missing_qdrant_credentials_use_local_fallback(monkeypatch, tmp_path):
+    saved = deepcopy(CONFIG)
+    monkeypatch.delenv("QDRANT_API_KEY", raising=False)
+    monkeypatch.delenv("CLUSTER_ENDPOINT", raising=False)
+    monkeypatch.setitem(CONFIG["rag"], "mode", "hybrid")
+    monkeypatch.setitem(CONFIG["vector_store"], "provider", "qdrant")
+    monkeypatch.setitem(CONFIG["vector_store"], "retrieval_mode", "hybrid")
+    monkeypatch.setitem(CONFIG["qdrant"], "collection_name", "test-collection")
+    monkeypatch.setitem(CONFIG["vector_store"], "fallback_to_chroma", True)
+    sentinel = object()
+
+    def fail_qdrant(*args, **kwargs):
+        raise ValueError("CLUSTER_ENDPOINT not found in .env file")
+
+    monkeypatch.setattr(indexer_factory, "_create_indexer", fail_qdrant)
+    monkeypatch.setattr(
+        semantic_chroma, "get_or_create_chroma_index", lambda path: sentinel
+    )
+
+    try:
+        assert indexer_factory.get_or_create_indexer(str(tmp_path)) is sentinel
+    finally:
+        CONFIG.clear()
+        CONFIG.update(saved)
+
+
+def test_qdrant_client_reset_is_reported_as_transport_failure(monkeypatch, tmp_path):
+    saved = deepcopy(CONFIG)
+    monkeypatch.setenv("QDRANT_API_KEY", "test-key")
+    monkeypatch.setenv("CLUSTER_ENDPOINT", "https://qdrant.example")
+    monkeypatch.setitem(CONFIG["rag"], "mode", "hybrid")
+    monkeypatch.setitem(CONFIG["vector_store"], "provider", "qdrant")
+    monkeypatch.setitem(CONFIG["vector_store"], "retrieval_mode", "hybrid")
+    monkeypatch.setitem(CONFIG["qdrant"], "collection_name", "test-collection")
+    monkeypatch.setitem(CONFIG["vector_store"], "fallback_to_chroma", False)
+
+    class FailingClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_collections(self):
+            raise ConnectionResetError("connection reset by peer")
+
+    monkeypatch.setattr(hybrid_qdrant, "QdrantClient", FailingClient)
+    monkeypatch.setattr(hybrid_qdrant, "get_embedder", lambda: object())
+
+    try:
+        with pytest.raises(VectorStoreUnavailableError, match="Vector store unavailable"):
+            indexer_factory.get_or_create_indexer(str(tmp_path))
+    finally:
+        CONFIG.clear()
+        CONFIG.update(saved)
+
+
+def test_qdrant_transport_failure_can_fail_fast(monkeypatch, tmp_path):
+    saved = deepcopy(CONFIG)
+    monkeypatch.setenv("QDRANT_API_KEY", "test-key")
+    monkeypatch.setenv("CLUSTER_ENDPOINT", "https://qdrant.example")
+    monkeypatch.setitem(CONFIG["rag"], "mode", "hybrid")
+    monkeypatch.setitem(CONFIG["vector_store"], "provider", "qdrant")
+    monkeypatch.setitem(CONFIG["vector_store"], "retrieval_mode", "hybrid")
+    monkeypatch.setitem(CONFIG["qdrant"], "collection_name", "test-collection")
+    monkeypatch.setitem(CONFIG["vector_store"], "fallback_to_chroma", False)
+
+    def fail_qdrant(*args, **kwargs):
+        raise ConnectionResetError("connection reset by peer")
+
+    monkeypatch.setattr(indexer_factory, "_create_indexer", fail_qdrant)
+
+    try:
+        with pytest.raises(VectorStoreUnavailableError, match="Vector store unavailable"):
+            indexer_factory.get_or_create_indexer(str(tmp_path))
+    finally:
+        CONFIG.clear()
+        CONFIG.update(saved)
+
+
+def test_relative_storage_paths_are_scoped_to_repository(tmp_path, monkeypatch):
+    monkeypatch.setitem(CONFIG["chromadb"], "persist_dir", ".terminus/chromadb/")
+    monkeypatch.setitem(CONFIG, "index", {"manifest_path": ".terminus/index/manifest.json"})
+
+    chroma_path = semantic_chroma._chroma_persist_path(tmp_path)
+    manifest_path = freshness._manifest_path(str(tmp_path))
+
+    assert chroma_path == tmp_path.resolve() / ".terminus" / "chromadb"
+    assert manifest_path == tmp_path.resolve() / ".terminus" / "index" / "manifest.json"

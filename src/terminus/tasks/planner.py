@@ -1,9 +1,11 @@
+from terminus.tasks.errors import classify_failure, format_failure
 from terminus.tasks.task_store import TaskType
 from pydantic import BaseModel
-from langchain.agents import create_agent
-from langchain.chat_models import init_chat_model
+from terminus.llm.factory import get_chat_model
+from terminus.llm.text import message_text
 from terminus.config import CONFIG
 from terminus.observability.logging import get_logger
+from terminus.observability.usage_tracker import UsageCallbackHandler, record
 
 
 logger = get_logger(__name__)
@@ -45,29 +47,117 @@ Rules:
 - output files must list every file the task will write to disk
 - acceptance_criteria must be concreate and verifiable (3-5 items per task)
 - task_type must be one of : design, implement, test, review, integrate, configure
+
+Response format: Return a single STRICT JSON object matching this schema exactly. No markdown fences, no prose, no explanation outside the JSON:
+
+{
+  "project_name": "string",
+  "goal_summary": "string",
+  "tech_stack": ["string"],
+  "total_estimated_hours": 0.0,
+  "tasks": [
+    {
+      "id": "task__001",
+      "title": "string",
+      "description": "string",
+      "task_type": "design",
+      "depends_on": [],
+      "estimated_minutes": 30,
+      "output_files": ["path/to/file.ext"],
+      "acceptance_criteria": ["string"]
+    }
+  ],
+  "risks": ["string"],
+  "assumptions": ["string"]
+}
 """
 
 
-def create_plan(goal: str, extra_content: str = "") -> ExecutionPlan:
-    """Call the LLM planner and return a structured ExecutionPlan."""
+def _extract_json(text: str) -> dict:
+    """Best-effort JSON extraction.
 
+    Free-tier models frequently wrap JSON in markdown fences or stray prose
+    even when asked for strict JSON.  Try strict parse first, then strip
+    fences, then extract the first `{...}` balanced block.
+    """
+    import json
+
+    t = text.strip()
+    try:
+        parsed = json.loads(t)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Strip ```json ... ```  / ``` ... ``` fences.
+    if t.startswith("```"):
+        lines = t.splitlines()
+        if lines and lines[0].strip().lstrip("`").strip() in ("json", ""):
+            t = "\n".join(lines[1:])
+        if t.endswith("```"):
+            t = t[:-3]
+        t = t.strip()
+        try:
+            parsed = json.loads(t)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: extract a balanced { ... } block (first { to last }).
+    start = t.find("{")
+    end = t.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = t[start : end + 1]
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(f"No valid JSON object found in planner output: {text[:200]}")
+
+
+def create_plan(goal: str, extra_content: str = "") -> ExecutionPlan:
+    """Call the LLM planner once and return a structured ExecutionPlan.
+
+    Uses plain invoke plus JSON-extraction instead of with_structured_output,
+    because free-tier providers frequently return markdown-wrapped or
+    prose-wrapped JSON that the strict structured-output parser rejects.
+
+    There is no retry loop here on purpose: the provider route
+    (llm.FallbackChatModel) already retries transient failures, and
+    handle_plan_command re-plans up to three times when the user asks for
+    changes. A third layer would multiply the wait on an already slow path.
+    """
     provider = CONFIG["llm"]["provider"]
     model = CONFIG["llm"]["planner_model"]
-
-    llm = init_chat_model(model, model_provider=provider)
-
-    structured_llm = llm.with_structured_output(ExecutionPlan)
+    llm = get_chat_model(model, model_provider=provider)
 
     user_message = f"Goal: {goal}"
-
     if extra_content:
         user_message += f"\nExtra Context: {extra_content}"
 
-    plan: ExecutionPlan = structured_llm.invoke([
+    messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_message},
-    ])
+    ]
 
+    handler = UsageCallbackHandler(kind="planner")
+    try:
+        raw = llm.invoke(messages, config={"callbacks": [handler]})
+        plan = ExecutionPlan.model_validate(_extract_json(message_text(raw)))
+    except Exception as exc:
+        record(handler.records, "planner")
+        failure = classify_failure(exc, provider=provider, model=model)
+        logger.warning("Planner call failed: %s", format_failure(failure, provider, model))
+        raise
+
+    record(handler.records, "planner")
+    if not plan.tasks:
+        raise ValueError("Planner returned an empty plan")
     return plan
 
 

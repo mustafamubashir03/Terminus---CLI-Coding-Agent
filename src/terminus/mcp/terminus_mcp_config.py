@@ -2,15 +2,15 @@ import os
 import re
 import json
 from pathlib import Path
-from dotenv import load_dotenv
 
-load_dotenv()
+from terminus.env import load_project_env
 
 _CONFIG_PATH = Path.cwd() / "terminus_mcp_servers.json"
 
 
 def load_terminus_mcp_config() -> dict:
     """Return MCP server config from the current project."""
+    load_project_env(Path.cwd())
     os.environ.setdefault("CWD",str(Path.cwd()))
 
     if not _CONFIG_PATH.exists():

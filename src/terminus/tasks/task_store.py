@@ -1,22 +1,32 @@
 import time
-from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from terminus.observability.logging import get_logger
 import json
+import os
 import uuid
 import sqlite3
 from contextlib import contextmanager
+from terminus.tasks.errors import _NON_RETRYABLE_PREFIXES
 
 logger = get_logger(__name__)
 
 class TaskStatus(str, Enum):
-    """All valid states of a task. 
-    PENDING: task is waiting to be started.
+    """All valid states of a task.
+    PENDING: task is waiting to be started (also the retry state).
     IN_PROGRESS: task is currently being worked on.
     COMPLETED: task has been completed.
-    FAILED: task has failed and cannot be retried.
-    BLOCKED: task is blocked by another task and cannot be started.
-    SKIPPED: task has been skipped and will not be worked on.
+    FAILED: task has permanently failed (retry budget exhausted in this run).
+    BLOCKED: (reserved) task is blocked by another task and cannot be started.
+    SKIPPED: (reserved) task has been skipped and will not be worked on.
+
+    Transitions:
+      PENDING -> IN_PROGRESS  (claim_task)
+      IN_PROGRESS -> COMPLETED (complete_task)
+      IN_PROGRESS -> PENDING   (fail_task, when retry budget remains; recover_interrupted_tasks)
+      IN_PROGRESS -> FAILED    (fail_task, when retry budget exhausted)
+      FAILED -> PENDING        (reset_failed_tasks_for_recovery, i.e. manual /plan continue)
+      PENDING -> BLOCKED       (never persisted; blocking is computed dynamically)
     """
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
@@ -41,38 +51,83 @@ class ProjectStatus(str, Enum):
     FAILED = "failed"
     PAUSED = "paused"
 
-@dataclass
-class Task:
-    """ 
-    Single unit of work inside a project
-    """
-    id: str
-    project_id: str
-    title: str
-    description: str
-    task_type: str
-    status: str = TaskStatus.PENDING
-    depends_on: str="[]"
-    output_files: str = "[]"
-    result: str| None = None
-    error: str | None = None
-    retry_count: int = 0
-    max_retries: int = 3
-    execution_order: int = 0
-    started_at: float | None = None
-    created_at: float = field(default_factory=time.time)
-    completed_at: float | None = None
 
+def _same_workspace(a: str, b: str) -> bool:
+    """Compare two workspace paths, tolerating symlinks and case on Windows."""
+    try:
+        return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+    except OSError:
+        return os.path.normcase(a) == os.path.normcase(b)
+
+
+MAX_PERSISTED_RESULT_CHARS = 8_000
+"""Ceiling on what one task row may store in ``result`` or ``error``.
+
+A worker's answer is model output, so its length is not something the runtime
+controls. 8k matches the other text budgets in Terminus (a shell stream, one
+deliverable file) and is far more than a task summary needs, while keeping a
+chatty or looping worker from growing the task database without limit.
+
+Downstream tasks read these strings through get_dep_results, so bounding at the
+persistence boundary bounds dependency inputs too.
+"""
+
+MAX_RECOVERY_CYCLES = 3
+"""How many times ``/plan continue`` may re-open a project's failed tasks.
+
+Each cycle grants a fresh per-cycle attempt budget, so without a cap the total
+attempts for one task would be unbounded. Three cycles is deliberately explicit
+and small: it is enough to recover from a genuine environment problem (a bad
+credential, a missing dependency) without letting a task that cannot succeed
+retry forever. A module constant rather than configuration, matching the other
+runtime bounds in Terminus.
+"""
+
+
+def bounded_result(text: str) -> str:
+    """Bound *text* to MAX_PERSISTED_RESULT_CHARS, keeping head and tail.
+
+    Truncation is explicit and never changes meaning: the marker states how much
+    was dropped. The head keeps the summary of what was done, the tail keeps the
+    closing remarks and quoted file contents, which is where a worker's most
+    useful detail usually sits.
+
+    This is the single owner of task-result truncation. It must never turn a
+    successful task into a failed one, so it is a pure string operation and is
+    applied by the store, not by the worker.
+    """
+    if text is None:
+        return ""
+    text = str(text)
+    if len(text) <= MAX_PERSISTED_RESULT_CHARS:
+        return text
+    head = (MAX_PERSISTED_RESULT_CHARS * 2) // 3
+    tail = MAX_PERSISTED_RESULT_CHARS - head
+    dropped = len(text) - MAX_PERSISTED_RESULT_CHARS
+    return (
+        f"{text[:head]}\n"
+        f"... [truncated: {dropped} of {len(text)} characters omitted; "
+        f"showing the first {head} and last {tail}]\n"
+        f"{text[-tail:]}"
+    )
 
 class TaskStore:
     def __init__(self, db_path:str="tasks.db"):
         self.db_path = db_path
+        # The store owns its own location: a caller that only wants to *read*
+        # state (cli.show_task_status) must not have to create the directory
+        # first, or it crashes with "unable to open database file" on a
+        # project that has never run /plan.
+        parent = Path(db_path).parent
+        if str(parent):
+            parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
     @contextmanager
     def conn(self):
         connection = sqlite3.connect(self.db_path)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
         try:
             yield connection
             connection.commit()
@@ -91,7 +146,9 @@ class TaskStore:
                     goal TEXT,
                     plan_json TEXT,
                     status TEXT,
-                    created_at REAL DEFAULT (unixepoch())
+                    created_at REAL DEFAULT (unixepoch()),
+                    workspace TEXT,
+                    recovery_cycles INTEGER DEFAULT 0
                 )
             ''')
             connection.execute('''
@@ -109,6 +166,7 @@ class TaskStore:
                     error TEXT,
                     retry_count INTEGER DEFAULT 0,
                     max_retries INTEGER DEFAULT 3,
+                    total_attempts INTEGER DEFAULT 0,
                     execution_order INTEGER DEFAULT 0,
                     started_at REAL,
                     created_at REAL DEFAULT (unixepoch()),
@@ -118,6 +176,39 @@ class TaskStore:
                 )
             ''')
             self._migrate_task_primary_key(connection)
+            self._migrate_project_workspace(connection)
+            self._add_column_if_missing(connection, "projects", "recovery_cycles",
+                                        "INTEGER DEFAULT 0")
+            self._add_column_if_missing(connection, "tasks", "total_attempts",
+                                        "INTEGER DEFAULT 0")
+
+    def _add_column_if_missing(self, connection: sqlite3.Connection, table: str,
+                               column: str, definition: str) -> None:
+        """Add one column to an existing database, if it is not already there."""
+        existing = {
+            row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        if column in existing:
+            return
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        logger.info("Added %s.%s to existing task database", table, column)
+
+    def _migrate_project_workspace(self, connection: sqlite3.Connection) -> None:
+        """Add projects.workspace to databases created before workspace identity.
+
+        A project records the directory it was planned for. Without it, a project
+        whose .terminus directory has been copied or moved is still reported as
+        resumable from anywhere, and its workers then edit the wrong tree.
+        Existing rows are left NULL, which is treated as "unknown" and allowed
+        once so pre-existing projects keep working.
+        """
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(projects)")
+        }
+        if "workspace" in columns:
+            return
+        connection.execute("ALTER TABLE projects ADD COLUMN workspace TEXT")
+        logger.info("Added projects.workspace column to existing task database")
 
     def _migrate_task_primary_key(self, connection: sqlite3.Connection) -> None:
         """Migrate legacy single-column task PK schema to composite (project_id, id)."""
@@ -205,7 +296,7 @@ class TaskStore:
                 """
                 SELECT id, project_id, title, description, task_type,
                 status, depends_on, output_files, acceptance_criteria,
-                result, error, retry_count, max_retries,
+                result, error, retry_count, max_retries, total_attempts,
                 execution_order, started_at, created_at, completed_at
                 FROM tasks
                 WHERE project_id=?
@@ -215,16 +306,23 @@ class TaskStore:
 
         return [dict(row) for row in rows]
 
-    def create_project(self, goal:str, plan)->str:
+    def create_project(self, goal:str, plan, workspace: str | None = None)->str:
         """
         Persist an approved ExecutionPlan as a project + task rows.
         Returns the new project_id (UUID)
-         """
+
+        ``workspace`` records the project directory this plan belongs to, so a
+        later run can refuse to execute it somewhere else. Defaults to the
+        current project root.
+        """
+        if workspace is None:
+            from terminus.workspace import project_root
+            workspace = str(project_root())
         project_id = str(uuid.uuid4())
         created_at = time.time()
         with self.conn() as conn:
             conn.execute(
-                "INSERT INTO projects(id, name, goal, plan_json, status, created_at) VALUES(?,?,?,?,?,?)",
+                "INSERT INTO projects(id, name, goal, plan_json, status, created_at, workspace) VALUES(?,?,?,?,?,?,?)",
                 (
                     project_id,
                     plan.project_name,
@@ -232,29 +330,48 @@ class TaskStore:
                     plan.model_dump_json(),
                     ProjectStatus.APPROVED.value,
                     created_at,
+                    workspace,
                 ),
             )
+            _placeholder_terms = {"", "placeholder", "dummy", "none", "null", "tbd", "todo"}
+            skipped_placeholders = 0
             for i, pt in enumerate(plan.tasks):
+                title_lower = (pt.title or "").strip().lower()
+                desc_lower = (pt.description or "").strip().lower()
+                criteria = [c.strip().lower() for c in pt.acceptance_criteria or []]
+                is_placeholder = (
+                    title_lower in _placeholder_terms
+                    and desc_lower in _placeholder_terms
+                ) or (
+                    title_lower in ("placeholder", "dummy")
+                    and criteria == ["placeholder"]
+                )
+                if is_placeholder:
+                    conn.execute(
+                        """INSERT INTO tasks(id, project_id, title, description, task_type, depends_on, output_files, acceptance_criteria, execution_order, status, result, completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            pt.id, project_id, pt.title, pt.description,
+                            pt.task_type.value, json.dumps(pt.depends_on),
+                            json.dumps(pt.output_files), json.dumps(pt.acceptance_criteria),
+                            i, TaskStatus.COMPLETED.value,
+                            "skipped: placeholder task from the plan", time.time(),
+                        ),
+                    )
+                    skipped_placeholders += 1
+                    logger.info(f"Skipping placeholder task {pt.id} '{pt.title}'")
+                    continue
                 conn.execute(
                     """INSERT INTO tasks(id, project_id, title, description, task_type, depends_on, output_files, acceptance_criteria, execution_order) VALUES(?,?,?,?,?,?,?,?,?)""",
                     (pt.id, project_id, pt.title, pt.description, pt.task_type.value, json.dumps(pt.depends_on), json.dumps(pt.output_files), json.dumps(pt.acceptance_criteria), i)
                 )
+            extra = {"project_id": project_id, "task_count": len(plan.tasks)}
+            if skipped_placeholders:
+                extra["skipped_placeholders"] = skipped_placeholders
         logger.info(
             "Successfully created project and tasks",
-            extra={"project_id": project_id, "task_count": len(plan.tasks)},
+            extra=extra,
         )
         return project_id
-
-    def get_latest_approved_project(self) -> str | None:
-        """Return the most recently approved project_id, or None if none exists."""
-        with self.conn() as conn:
-            row = conn.execute(
-                "SELECT id FROM projects WHERE status=? ORDER BY created_at DESC LIMIT 1",
-                (ProjectStatus.APPROVED.value,),
-            ).fetchone()
-            if row:
-                return row[0]
-        return None
 
     def get_resumable_project(self) -> str | None:
         """Return the newest project that still has recoverable work."""
@@ -296,6 +413,30 @@ class TaskStore:
                 return row[0]
         return None
 
+    def get_project_workspace(self, project_id: str) -> str | None:
+        """The project directory a project was created for, or None if unknown."""
+        with self.conn() as conn:
+            row = conn.execute(
+                "SELECT workspace FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+        return (row["workspace"] if row else None) or None
+
+    def workspace_matches(self, project_id: str, workspace: str | None = None) -> bool:
+        """Is this project safe to run in *workspace* (defaults to the current one)?
+
+        True when the recorded workspace matches, or when nothing was recorded
+        (a project created before workspace identity existed, or one that has
+        never been given a directory). False means the project belongs to a
+        different directory and must not be executed here.
+        """
+        recorded = self.get_project_workspace(project_id)
+        if not recorded:
+            return True
+        if workspace is None:
+            from terminus.workspace import project_root
+            workspace = str(project_root())
+        return _same_workspace(recorded, workspace)
+
     def update_project_status(self, project_id: str, status: str) -> None:
         with self.conn() as conn:
             conn.execute(
@@ -320,7 +461,17 @@ class TaskStore:
             self.update_project_status(project_id, ProjectStatus.PAUSED.value)
 
     def recover_interrupted_tasks(self, project_id: str) -> int:
-        """Reset in-progress tasks to pending on resume (single-process assumption)."""
+        """
+        Reset in-progress tasks to pending on resume.
+
+        ASSUMPTION: Terminus is intentionally single-process/single-orchestrator for
+        a given project. A task that is still IN_PROGRESS when an orchestration run
+        begins can therefore only belong to a previous crashed/interrupted process
+        (Ctrl+C, terminal crash, Python exception, machine restart), so resetting it
+        to PENDING is safe. Two Terminus processes must not claim the same pending
+        task for the same project; `claim_task()` remains atomic so a second process
+        can never double-execute a task.
+        """
         with self.conn() as conn:
             cur = conn.execute(
                 """
@@ -332,46 +483,137 @@ class TaskStore:
             )
             return cur.rowcount
 
-    def reset_retryable_failed_tasks(self, project_id: str) -> int:
-        """Reset permanently-failed tasks that still have retries left."""
+    def reset_failed_tasks_for_recovery(self, project_id: str) -> int:
+        """
+        Manual recovery for `/plan continue`.
+
+        Each call starts a new *recovery cycle*: the per-cycle attempt counter is
+        reset so the task gets a fresh automatic budget, and the project's cycle
+        counter goes up. Without a cap, an operator (or a script) could invoke
+        /plan continue forever and a permanently failing task would retry
+        without limit - which is the loop this method exists to prevent.
+
+        So the number of cycles is bounded by MAX_RECOVERY_CYCLES. A project that
+        has used them is not reset again; its failure stands and the user is told
+        why. The cumulative ``total_attempts`` on each task is never reset, so
+        the real history of a task is always visible.
+
+        Returns the number of tasks reset (0 when the cap has been reached).
+        """
         with self.conn() as conn:
+            row = conn.execute(
+                "SELECT recovery_cycles FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Project {project_id} not found")
+            cycles = row["recovery_cycles"] or 0
+            if cycles >= MAX_RECOVERY_CYCLES:
+                logger.warning(
+                    "Project %s has used all %d recovery cycles; not resetting",
+                    project_id, MAX_RECOVERY_CYCLES,
+                )
+                return 0
+
+            conn.execute(
+                "UPDATE projects SET recovery_cycles=? WHERE id=?",
+                (cycles + 1, project_id),
+            )
             cur = conn.execute(
                 """
                 UPDATE tasks
-                SET status=?, started_at=NULL
+                SET status=?, retry_count=0, error=NULL, started_at=NULL
                 WHERE project_id=?
                   AND status=?
-                  AND retry_count < max_retries
                 """,
                 (TaskStatus.PENDING.value, project_id, TaskStatus.FAILED.value),
             )
+            logger.info(
+                "Recovery cycle %s/%s for project %s: reset %s failed task(s)",
+                cycles + 1, MAX_RECOVERY_CYCLES, project_id, cur.rowcount,
+            )
             return cur.rowcount
 
+    def get_recovery_cycles(self, project_id: str) -> int:
+        """How many `/plan continue` recovery cycles this project has used."""
+        with self.conn() as conn:
+            row = conn.execute(
+                "SELECT recovery_cycles FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+        return (row["recovery_cycles"] or 0) if row else 0
+
     def get_blocked_by_failed(self, project_id: str) -> list[dict]:
-        """Return pending tasks blocked by permanently failed dependencies."""
+        """Return pending tasks blocked (directly or transitively) by failed dependencies.
+
+        A task X is reported as blocked when any failed task F is reachable from X
+        through its dependency graph (X -> ... -> F). This gives the user-facing
+        recovery explanation the full chain, e.g. A -> B -> C with A failed reports
+        both B (blocked by A) and C (blocked by A).
+        """
         tasks = self._get_all_tasks(project_id)
-        by_id = {t["id"]: t for t in tasks}
+        status_by_id = {t["id"]: t["status"] for t in tasks}
+        dep_by_id: dict[str, list[str]] = {}
+        for t in tasks:
+            try:
+                dep_by_id[t["id"]] = json.loads(t.get("depends_on", "[]"))
+            except (TypeError, ValueError):
+                dep_by_id[t["id"]] = []
+
         failed_ids = {t["id"] for t in tasks if t["status"] == TaskStatus.FAILED.value}
+
+        def _transitively_blocks(task_id: str) -> set[str]:
+            """Return set of failed dependency ids reachable from task_id."""
+            blocking: set[str] = set()
+            seen: set[str] = set()
+            stack = list(dep_by_id.get(task_id, []))
+            while stack:
+                dep_id = stack.pop()
+                if dep_id in seen:
+                    continue
+                seen.add(dep_id)
+                if dep_id not in status_by_id:
+                    # Missing dependency ids must not silently deadlock; report them
+                    # as blocking so the user can fix the plan.
+                    blocking.add(f"missing:{dep_id}")
+                    continue
+                if dep_id in failed_ids:
+                    blocking.add(dep_id)
+                stack.extend(dep_by_id.get(dep_id, []))
+            return blocking
+
         blocked = []
         for task in tasks:
             if task["status"] != TaskStatus.PENDING.value:
                 continue
-            dep_ids = json.loads(task.get("depends_on", "[]"))
-            blocking = [dep_id for dep_id in dep_ids if dep_id in failed_ids]
+            blocking = sorted(_transitively_blocks(task["id"]))
             if blocking:
                 blocked.append({"task": task, "blocked_by": blocking})
         return blocked
 
-    def claim_task(self, project_id: str, task_id: str) -> bool:
+    def claim_task(self, project_id: str, task_id: str) -> int:
         """
-        Atomically claim a task if it's pending.
-        Returns True if claimed, False if already in-progress or completed/failed.
+        Atomically claim a pending task and report which attempt this is.
+
+        Returns the 1-based attempt number of the claim that was won, or 0 when
+        the task was not claimable (already in progress, completed or failed).
+        The attempt number is derived here, in the same statement that performs
+        the transition, so the scheduler and the worker can never disagree about
+        which attempt is running.
+
+        ``max_retries`` is the TOTAL attempts allowed in one recovery cycle, and
+        ``retry_count`` is how many have already been spent in this cycle, so a
+        claim always represents attempt ``retry_count + 1``.
+
+        ``total_attempts`` is incremented here, when the attempt *starts*, so it
+        counts every attempt whether it went on to succeed or fail. It is never
+        reset, which is what makes it a usable record of a task's real history
+        across /plan continue cycles.
         """
         with self.conn() as conn:
             cur = conn.execute(
                 """
                 UPDATE tasks
-                SET status=?, started_at=unixepoch()
+                SET status=?, started_at=unixepoch(),
+                    total_attempts=COALESCE(total_attempts, 0) + 1
                 WHERE project_id=? AND id=? AND status=?
                 """,
                 (
@@ -381,32 +623,75 @@ class TaskStore:
                     TaskStatus.PENDING.value,
                 ),
             )
-            return cur.rowcount == 1
+            if cur.rowcount != 1:
+                return 0
+            row = conn.execute(
+                "SELECT retry_count FROM tasks WHERE project_id=? AND id=?",
+                (project_id, task_id),
+            ).fetchone()
+            return (row["retry_count"] or 0) + 1
+
+    def next_attempt(self, project_id: str, task_id: str) -> int:
+        """The attempt a claim of this task would represent, without claiming."""
+        with self.conn() as conn:
+            row = conn.execute(
+                "SELECT retry_count FROM tasks WHERE project_id=? AND id=?",
+                (project_id, task_id),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"Task {task_id} not found in project {project_id}")
+        return (row["retry_count"] or 0) + 1
 
     def complete_task(self, project_id: str, task_id: str, result: str) -> None:
-        """Mark a task as completed and store the result."""
+        """Mark a task as completed and store a bounded result.
+
+        A task result is the worker's summary, not its conversation. The store
+        bounds what it persists so a chatty worker cannot grow the task database
+        without limit, and so downstream tasks read a bounded dependency string.
+        """
+        bounded = bounded_result(result)
         with self.conn() as conn:
             conn.execute(
                 """
                 UPDATE tasks
-                SET status=?, result=?, completed_at=unixepoch()
+                SET status=?, result=?, error=NULL, completed_at=unixepoch()
                 WHERE project_id=? AND id=?
                 """,
-                (TaskStatus.COMPLETED.value, result, project_id, task_id),
+                (TaskStatus.COMPLETED.value, bounded, project_id, task_id),
             )
         logger.info(
             "Completed task",
-            extra={"task_id": task_id, "result_chars": len(result)},
+            extra={"task_id": task_id, "result_chars": len(bounded),
+                   "truncated": len(bounded) != len(str(result or ""))},
         )
 
-    def fail_task(self, project_id: str, task_id: str, error: str) -> str:
+    def fail_task(self, project_id: str, task_id: str, error: str, *, force: bool = False) -> str:
         """
-        Record a task failure. Retries while retry_count < max_retries.
+        Record a task failure.
+
+        Retry semantics (explicit): `max_retries` is the TOTAL number of attempts.
+        A task fails on attempt N, retry_count becomes N. While retry_count < max_retries
+        the task returns to PENDING (will be retried within this run); once
+        retry_count >= max_retries it becomes permanently FAILED for this run.
+
+        When force=True (used for non-retryable/deterministic errors), the retry
+        budget is exhausted immediately and the task goes straight to FAILED.
+
         Returns the resulting status: 'pending' (will retry) or 'failed'.
+
+        Two counters, deliberately:
+          retry_count     attempts in the CURRENT recovery cycle that have FAILED.
+                          Reset by reset_failed_tasks_for_recovery, and the only
+                          thing the automatic budget is measured against.
+          total_attempts  every attempt ever started, successful or not.
+                          Incremented by claim_task and never reset, so a task's
+                          real history stays visible however often a human runs
+                          /plan continue.
         """
         with self.conn() as conn:
             row = conn.execute(
-                "SELECT retry_count, max_retries FROM tasks WHERE project_id=? AND id=?",
+                "SELECT retry_count, max_retries, total_attempts "
+                "FROM tasks WHERE project_id=? AND id=?",
                 (project_id, task_id),
             ).fetchone()
             if row is None:
@@ -414,8 +699,9 @@ class TaskStore:
 
             new_retry_count = row["retry_count"] + 1
             max_retries = row["max_retries"]
+            total_attempts = row["total_attempts"] or 0
 
-            if new_retry_count < max_retries:
+            if not force and new_retry_count < max_retries:
                 conn.execute(
                     """
                     UPDATE tasks
@@ -424,42 +710,66 @@ class TaskStore:
                     """,
                     (
                         TaskStatus.PENDING.value,
-                        error,
+                        bounded_result(error),
                         new_retry_count,
                         project_id,
                         task_id,
                     ),
                 )
                 logger.warning(
-                    f"Task {task_id} failed, retry {new_retry_count}/{max_retries}: {error[:200]}"
+                    f"Task {task_id} failed, retry {new_retry_count}/{max_retries} "
+                    f"(attempt {total_attempts} overall): {error[:200]}"
                 )
                 return TaskStatus.PENDING.value
 
+            persist_error = error
+            if not force:
+                for prefix in _NON_RETRYABLE_PREFIXES:
+                    if persist_error.startswith(prefix):
+                        persist_error = persist_error[len(prefix):]
+                        break
+                persist_error = "[retry-exhausted] [retryable] " + persist_error
+            else:
+                for prefix in _NON_RETRYABLE_PREFIXES:
+                    if persist_error.startswith(prefix):
+                        persist_error = persist_error[len(prefix):]
+                        break
+                persist_error = "[failed] " + persist_error
             conn.execute(
                 """
                 UPDATE tasks
                 SET status=?, error=?, retry_count=?
                 WHERE project_id=? AND id=?
                 """,
-                (TaskStatus.FAILED.value, error, new_retry_count, project_id, task_id),
+                (TaskStatus.FAILED.value, bounded_result(persist_error),
+                 new_retry_count, project_id, task_id),
             )
             logger.error(
-                f"Task {task_id} permanently failed after {new_retry_count} attempts: {error[:200]}"
+                f"Task {task_id} permanently failed after {new_retry_count} attempts "
+                f"in this cycle ({total_attempts} overall): {persist_error[:200]}"
             )
             return TaskStatus.FAILED.value
 
     def get_progress(self, project_id:str)->dict[str,int]:
         """
-        Return a dict with counts for pending, in-progress, completed, and failed tasks for a project.
+        Return a dict with counts for every task status of a project.
         """
         with self.conn() as conn:
             rows = conn.execute(
                     """ SELECT status, COUNT(*) as count FROM tasks WHERE project_id=? GROUP BY status """,
                     (project_id,)
                 ).fetchall()
-            progress = {"pending":0,"in_progress":0,"completed":0,"failed":0}
+            progress = {
+                TaskStatus.PENDING.value: 0,
+                TaskStatus.IN_PROGRESS.value: 0,
+                TaskStatus.COMPLETED.value: 0,
+                TaskStatus.FAILED.value: 0,
+                TaskStatus.BLOCKED.value: 0,
+                TaskStatus.SKIPPED.value: 0,
+            }
             for row in rows:
-                progress[row["status"]] = row["count"]
+                if row["status"] in progress:
+                    progress[row["status"]] = row["count"]
             return progress
 
     def get_dep_results(self, project_id: str, dep_ids: list[str]) -> list[dict[str, str]]:

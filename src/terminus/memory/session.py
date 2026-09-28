@@ -29,5 +29,9 @@ def new_session()->str:
 def switch_session(session_id:str)->None:
     """Switch to a different session"""
     session_file = _session_file()
+    # Must mirror new_session(): without this, switching raises FileNotFoundError
+    # whenever the state directory is absent, which takes the whole CLI down
+    # (the /switch command is not inside a try/except).
+    session_file.parent.mkdir(parents=True, exist_ok=True)
     session_file.write_text(session_id)
     logger.info(f"Switched to session: {session_id}")
