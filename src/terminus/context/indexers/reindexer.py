@@ -22,6 +22,7 @@ from terminus.context.indexers.freshness import (
     _now_iso,
 )
 from terminus.observability.logging import get_logger
+from terminus.context.qdrant_scope import chunk_metadata
 
 logger = get_logger(__name__)
 
@@ -71,13 +72,10 @@ def _parse_files_to_documents(filepaths: list[str]) -> tuple[list[Document], int
             docs.append(
                 Document(
                     page_content=chunk.content,
-                    metadata={
-                        "source": chunk.source,
-                        "name": chunk.name,
-                        "type": chunk.type,
-                        "start_line": chunk.start_line,
-                        "end_line": chunk.end_line,
-                    },
+                    # Scoped by the shared helper, so an incremental reindex
+                    # tags points exactly like a full index. Omitting this
+                    # would quietly produce unscoped points.
+                    metadata=chunk_metadata(chunk),
                 )
             )
     if skipped:
@@ -90,18 +88,18 @@ def _parse_files_to_documents(filepaths: list[str]) -> tuple[list[Document], int
 # ---------------------------------------------------------------------------
 
 def _qdrant_client_and_cfg():
-    """Return ``(QdrantClient, collection_name, api_key, endpoint)``."""
-    import os
+    """Return ``(QdrantClient, collection_name)``.
 
-    from qdrant_client import QdrantClient
+    Delegates to the shared client helper, so the reindexer stops being the one
+    place that built a Qdrant client without a timeout and with the version
+    check left on. ``api_key``/``endpoint`` are no longer returned: the upsert
+    helper needs a client, not credentials, and returning them is what kept this
+    function pinned to cloud.
+    """
+    from terminus.context.indexers import qdrant_client
+    from terminus.context.indexers.qdrant_client import collection_name
 
-    collection_name = CONFIG["qdrant"]["collection_name"]
-    api_key = os.getenv("QDRANT_API_KEY")
-    endpoint = os.getenv("CLUSTER_ENDPOINT")
-    if not api_key or not endpoint:
-        raise ValueError("QDRANT_API_KEY / CLUSTER_ENDPOINT not set")
-    client = QdrantClient(url=endpoint, api_key=api_key)
-    return client, collection_name, api_key, endpoint
+    return qdrant_client.create_qdrant_client(), collection_name()
 
 
 def _qdrant_delete_points(client: Any, collection: str, filepaths: list[str]) -> int:
@@ -173,23 +171,28 @@ def _ensure_source_payload_index(client: Any, collection: str) -> None:
 
 def _qdrant_upsert_documents(
     docs: list[Document], embedder: Any, sparse: Any, retrieval_mode: Any,
-    collection: str, api_key: str, endpoint: str, batch_size: int = 50,
+    client: Any, collection: str, batch_size: int = 50,
 ) -> None:
-    """Upsert *docs* into a Qdrant collection."""
+    """Upsert *docs* into a Qdrant collection.
+
+    Goes through the constructor plus ``add_documents`` rather than
+    ``from_documents``, because the installed ``langchain-qdrant`` forwards a
+    ``client=`` argument into its HTTP client and rejects it - which makes the
+    classmethod unusable for a local store, and inconsistent with the indexers
+    even for cloud.
+    """
     if not docs:
         return
     from langchain_qdrant import QdrantVectorStore
 
-    QdrantVectorStore.from_documents(
-        documents=docs,
+    store = QdrantVectorStore(
+        client=client,
+        collection_name=collection,
         embedding=embedder,
         sparse_embedding=sparse,
         retrieval_mode=retrieval_mode,
-        collection_name=collection,
-        url=endpoint,
-        api_key=api_key,
-        batch_size=batch_size,
     )
+    store.add_documents(docs, batch_size=batch_size)
 
 
 def _qdrant_wipe_collection(client: Any, collection: str) -> None:
@@ -392,7 +395,7 @@ def _apply_qdrant_incremental(
     )
     from terminus.llm.factory import get_embedder
 
-    client, collection, api_key, endpoint = _qdrant_client_and_cfg()
+    client, collection = _qdrant_client_and_cfg()
     embedder = get_embedder()
 
     # Ensure metadata.source is indexed so filtered deletions work
@@ -413,19 +416,18 @@ def _apply_qdrant_incremental(
             retrieval_mode = get_retrieval_mode()
             _qdrant_upsert_documents(
                 docs, embedder, sparse, retrieval_mode,
-                collection, api_key, endpoint,
+                client, collection,
             )
         else:
             from langchain_qdrant import QdrantVectorStore
 
-            QdrantVectorStore.from_documents(
-                documents=docs,
-                embedding=embedder,
+            # Constructor + add_documents, not from_documents: the installed
+            # langchain-qdrant rejects an injected client in the classmethods.
+            QdrantVectorStore(
+                client=client,
                 collection_name=collection,
-                url=endpoint,
-                api_key=api_key,
-                batch_size=50,
-            )
+                embedding=embedder,
+            ).add_documents(docs, batch_size=50)
         logger.info(f"Upserted {chunk_count} new/updated chunks into Qdrant")
 
 
@@ -507,7 +509,7 @@ def _apply_qdrant_full(
     from terminus.context.indexers.hybrid_qdrant import get_retrieval_mode
     from terminus.llm.factory import get_embedder
 
-    client, collection, api_key, endpoint = _qdrant_client_and_cfg()
+    client, collection = _qdrant_client_and_cfg()
     embedder = get_embedder()
 
     # Ensure metadata.source is indexed so filtered deletions work
@@ -525,20 +527,19 @@ def _apply_qdrant_full(
         retrieval_mode = get_retrieval_mode()
         _qdrant_upsert_documents(
             docs, embedder, sparse, retrieval_mode,
-            collection, api_key, endpoint,
+            client, collection,
         )
     else:
         from langchain_qdrant import QdrantVectorStore
 
         if docs:
-            QdrantVectorStore.from_documents(
-                documents=docs,
-                embedding=embedder,
+            # Constructor + add_documents, not from_documents: the installed
+            # langchain-qdrant rejects an injected client in the classmethods.
+            QdrantVectorStore(
+                client=client,
                 collection_name=collection,
-                url=endpoint,
-                api_key=api_key,
-                batch_size=50,
-            )
+                embedding=embedder,
+            ).add_documents(docs, batch_size=50)
     result.chunks_added = chunk_count
     logger.info(f"Full Qdrant rebuild: {chunk_count} chunks")
 
@@ -571,24 +572,24 @@ def _apply_chroma_full(
 def _connect_existing(provider: str, repo_path: str) -> Any:
     """Return a connected vector store / collection (read-only, no reindex)."""
     if provider == "qdrant":
-        import os
-
         from langchain_qdrant import QdrantVectorStore
 
+        from terminus.context.indexers.qdrant_client import collection_name
+        from terminus.context.indexers.qdrant_store import open_qdrant_store
         from terminus.llm.factory import get_embedder
 
-        collection = CONFIG["qdrant"]["collection_name"]
-        api_key = os.getenv("QDRANT_API_KEY")
-        endpoint = os.getenv("CLUSTER_ENDPOINT")
+        collection = collection_name()
         embedder = get_embedder()
         mode = _get_mode()
 
-        kwargs: dict[str, Any] = dict(
-            collection_name=collection,
-            embedding=embedder,
-            url=endpoint,
-            api_key=api_key,
-        )
+        # The shared opener, so this read-only path honours qdrant.mode and the
+        # shared timeout like every other path.
+        base = open_qdrant_store(collection)
+        kwargs: dict[str, Any] = {
+            "client": base.client,
+            "collection_name": collection,
+            "embedding": embedder,
+        }
         if mode == "hybrid":
             from langchain_qdrant import FastEmbedSparse, RetrievalMode
 
@@ -598,7 +599,7 @@ def _connect_existing(provider: str, repo_path: str) -> Any:
             kwargs["retrieval_mode"] = RetrievalMode.HYBRID
 
         return QdrantVectorStore.from_existing_collection(**kwargs)
-    elif provider in ("chromadb", "chroma"):
+    if provider in ("chromadb", "chroma"):
         collection, _ = _chroma_collection(repo_path)
         return collection
     return None

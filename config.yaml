@@ -18,6 +18,8 @@ llm:
       model: gemini-3.5-flash-lite
     - provider: cohere
       model: command-r-plus-08-2024
+    - provider: groq
+      model: openai/gpt-oss-120b
   route_max_attempts: 2
   route_backoff_seconds: 5
   # Per-attempt HTTP/socket timeout for a single LLM request, and max_retries
@@ -59,11 +61,18 @@ rag:
 vector_store:
   provider: qdrant
   retrieval_mode: hybrid
-  fallback_to_chroma: true
+  # Off: a failing Qdrant must fail loudly rather than silently becoming Chroma.
+  # Set true to get the old behaviour back, reported rather than hidden.
+  fallback_to_chroma: false
 
 qdrant:
   collection_name: terminus_hybrid
   timeout_seconds: 5
+  # local | cloud. 'cloud' keeps the existing Qdrant Cloud setup (CLUSTER_ENDPOINT
+  # + QDRANT_API_KEY in .env). Switch to 'local' for an index that needs no
+  # credentials at all, stored under .terminus/qdrant/.
+  mode: cloud
+  path: .terminus/qdrant
 
 embeddings:
   provider: huggingface

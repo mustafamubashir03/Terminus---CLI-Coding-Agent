@@ -12,18 +12,18 @@ EXTENSION_TO_LANGUAGE = {
     # Python
     '.py': 'python',
     '.pyi': 'python',
-    
+
     # JavaScript / TypeScript
     '.js': 'javascript',
     '.jsx': 'javascript',
     '.ts': 'typescript',
     '.tsx': 'tsx',
-    
+
     # Java / Kotlin / Scala
     '.java': 'java',
     '.kt': 'kotlin',
     '.scala': 'scala',
-    
+
     # C / C++ / Objective-C
     '.c': 'c',
     '.cpp': 'cpp',
@@ -31,25 +31,25 @@ EXTENSION_TO_LANGUAGE = {
     '.hpp': 'cpp',
     '.m': 'objc',
     '.mm': 'objc',
-    
+
     # C# / F# / VB.NET
     '.cs': 'c_sharp',
     '.fs': 'f_sharp',
     '.vb': 'vb_net',
-    
+
     # Go
     '.go': 'go',
-    
+
     # Rust
     '.rs': 'rust',
-    
+
     # Web
     '.html': 'html',
     '.css': 'css',
     '.scss': 'scss',
     '.sass': 'scss',
     '.less': 'less',
-    
+
     # Markup
     '.md': 'markdown',
     '.markdown': 'markdown',
@@ -57,7 +57,7 @@ EXTENSION_TO_LANGUAGE = {
     '.json': 'json',
     '.yaml': 'yaml',
     '.yml': 'yaml',
-    
+
     # Shell / Batch
     '.sh': 'bash',
     '.bash': 'bash',
@@ -66,13 +66,13 @@ EXTENSION_TO_LANGUAGE = {
     '.ps1': 'powershell',
     '.bat': 'batch',
     '.cmd': 'batch',
-    
+
     # PHP
     '.php': 'php',
-    
+
     # Ruby
     '.rb': 'ruby',
-    
+
     # Config / Other
     '.ini': 'ini',
     '.conf': 'ini',
@@ -100,7 +100,7 @@ BLOCK_NODE_TYPES={
     "method_declaration": "method",
     "constructor_declaration": "constructor",
     "destructor_declaration": "destructor",
-    
+
 }
 
 @dataclass
@@ -164,7 +164,7 @@ def _walk(node,source:str,filepath:str,chunks:list[ParsedChunk],depth:int):
 
     for child in node.children:
         _walk(child,source,filepath,chunks,depth+1)
-        
+
 
 def _extract_name(node, source:str)->str:
      """Find the identifier child of a block node"""
@@ -207,14 +207,13 @@ def get_source_files(repo_path:str, skips_dirs: list[str] | None = None)->list[s
         str(path) for path in Path(repo_path).rglob('*')
         if path.suffix.lower() in ALL_EXTENSION
         and not any(part in skip for part in path.parts)
-        
+
     ]
     logger.info(f"Found {len(files)} source files in {repo_path}")
     return files
-        
-    
-        
-    
 
-    
-    
+
+
+
+
+

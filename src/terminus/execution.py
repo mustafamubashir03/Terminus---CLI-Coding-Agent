@@ -52,6 +52,66 @@ class WorkspaceMismatch(RuntimeError):
 
 ASK = "ask"
 TASK = "task"
+MAX_CHILDREN_PER_PARENT = 8
+"""Total children one parent execution may delegate, across every call.
+
+Per execution, not per ``spawn_agent`` call and not per conversation. Without
+this, a model could call ``spawn_agent`` repeatedly and multiply the budget by
+the number of calls, which is how a convenience primitive becomes an unbounded
+cost. Eight is enough for a genuinely multi-area investigation and small enough
+that a delegation habit is immediately visible in telemetry.
+
+This is the one place the number is declared. ``terminus.agents.spawn`` re-exports
+it as ``MAX_CHILD_AGENTS`` for callers that think in terms of the spawner; nothing
+declares it twice, so the spawner's ceiling and the budget's ceiling cannot
+disagree.
+"""
+
+CHILD = "child"
+"""A delegated subagent spawned by an existing execution.
+
+Its own context, with its own policy, rather than the parent's. The parent's
+authority is not inherited implicitly: a child is granted what its role allows,
+which is a subset of what the parent could do, and never more.
+"""
+
+
+@dataclass
+class ExecutionBudget:
+    """A per-execution allowance, spent as work is delegated.
+
+    Scoped to one parent execution and owned by it: the object is created with
+    the context and dies with it. There is no global or cross-turn store, so a
+    busy conversation cannot spend a later, unrelated turn's allowance, and
+    nothing has to be cleaned up when the execution ends.
+
+    Mutable on purpose - unlike :class:`ExecutionContext`, which stays frozen.
+    The context says *who* is executing; this says *how much is left*.
+    """
+
+    max_children: int
+    _used: int = 0
+
+    @property
+    def used(self) -> int:
+        return self._used
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.max_children - self._used)
+
+    def claim(self, count: int = 1) -> int:
+        """Reserve up to *count* children; return how many were actually granted.
+
+        Partial grants are the point. Asking for five with three left grants
+        three and returns three, so the caller can run what it got and report
+        the rest as blocked rather than either silently dropping them or
+        silently exceeding the budget.
+        """
+        wanted = max(0, int(count))
+        granted = min(wanted, self.remaining)
+        self._used += granted
+        return granted
 
 
 @dataclass(frozen=True)
@@ -69,10 +129,25 @@ class ExecutionContext:
     project_id: str | None = None
     task_id: str | None = None
     policy: PermissionPolicy = PermissionPolicy()
+    parent_agent_id: str | None = None
+    """Set on a child execution, naming the agent that delegated to it.
+
+    Kept here rather than only in the agent layer because this is the object
+    the permission and tool layer already reads, so a child is identifiable at
+    the point where authority is actually enforced.
+    """
+
+    budget: "ExecutionBudget | None" = None
+    """This execution's remaining delegation allowance, or None if it delegates.
+
+    A parent carries one; a child does not, because children may not delegate.
+    """
 
     @property
     def label(self) -> str:
         """Short identity for logs and error messages."""
+        if self.parent_agent_id:
+            return f"{self.kind} of {self.parent_agent_id}"
         if self.task_id:
             return f"task {self.task_id}"
         return self.kind
@@ -127,9 +202,19 @@ def require_workspace(workspace) -> Path:
     return wanted
 
 
-def ask_context(policy: PermissionPolicy) -> ExecutionContext:
-    """The execution for one /ask turn."""
-    return ExecutionContext(workspace=project_root(), kind=ASK, policy=policy)
+def ask_context(
+    policy: PermissionPolicy, max_children: int = MAX_CHILDREN_PER_PARENT
+) -> ExecutionContext:
+    """The execution for one /ask turn.
+
+    Carries a fresh delegation budget. A new turn gets a new budget, so a long
+    conversation does not permanently exhaust the allowance - unrelated later
+    work is not charged for earlier delegation.
+    """
+    return ExecutionContext(
+        workspace=project_root(), kind=ASK, policy=policy,
+        budget=ExecutionBudget(max_children=max_children),
+    )
 
 
 def task_context(
@@ -150,4 +235,5 @@ def task_context(
         project_id=project_id,
         task_id=task_id,
         policy=policy,
+        budget=ExecutionBudget(max_children=MAX_CHILDREN_PER_PARENT),
     )

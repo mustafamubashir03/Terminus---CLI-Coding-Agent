@@ -1,3 +1,23 @@
+"""Configuration: the defaults, and the one place a config file is resolved.
+
+Precedence, highest first:
+
+    the current directory's ``config.yaml``
+    the packaged ``config.yaml`` (shipped defaults for an installed Terminus)
+    ``DEFAULT_CONFIG`` below
+
+The first file that exists wins outright - it is *not* a merge of all of them.
+That is deliberate. Layering three files would make it impossible to say where
+any single value came from, and a user who edits their project config would have
+to know which of the other layers was overriding them.
+
+``CONFIG`` is the resolved result, built once at import. Everything else in
+Terminus reads it rather than re-reading the file, so there is exactly one
+resolved configuration per process. A write goes through
+``terminus.cli_app.settings.set_value``, which edits that same file in place so
+``terminus config set`` and a hand edit cannot disagree.
+"""
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -45,13 +65,29 @@ DEFAULT_CONFIG = {
     },
     "rag": {"mode": "semantic"},
     "vector_store": {
+        # A credential-free local store is the default, so a fresh install works
+        # with nothing configured. Chroma is the default provider because it is
+        # local by construction and needs no further decision; Qdrant is a
+        # one-line change and defaults to its own local mode.
         "provider": "chromadb",
         "retrieval_mode": "semantic",
-        "fallback_to_chroma": True,
+        # Off by default. Substituting a different backend because the
+        # configured one failed makes retrieval non-deterministic, and it used to
+        # rewrite `provider` and `rag.mode` in the global config so the swap
+        # outlived the process that hit the failure. Opt in deliberately and the
+        # swap is reported rather than silent.
+        "fallback_to_chroma": False,
     },
     "qdrant": {
         "collection_name": "terminus_hybrid",
         "timeout_seconds": 5,
+        # "local" or "cloud". Left empty on purpose: an absent value resolves by
+        # terminus.context.indexers.qdrant_client.qdrant_mode() to cloud when
+        # CLUSTER_ENDPOINT is set and local otherwise, so an existing cloud
+        # configuration keeps working untouched.
+        "mode": "",
+        "path": ".terminus/qdrant",
+        "url": "",
     },
     "chromadb": {
         "persist_dir": ".terminus/chromadb/",

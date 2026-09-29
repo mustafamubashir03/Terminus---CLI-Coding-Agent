@@ -43,3 +43,15 @@ def project_root() -> Path:
 def project_key() -> str:
     """A stable string identity for the current project, safe for cache keys."""
     return str(project_root())
+
+
+PROJECT_METADATA_KEY = "project"
+"""Qdrant payload key that scopes an indexed chunk to one project.
+
+The collection is shared by every project, so this field is the only thing
+stopping project A's code from being retrieved while working in project B. The
+writer (the indexers) and the reader (the retriever) must agree on the name, so
+it is defined here next to the identity it carries rather than in either of
+them.
+"""
+

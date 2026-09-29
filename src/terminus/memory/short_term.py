@@ -1,3 +1,22 @@
+"""Conversational memory: the checkpoint store, and when to summarise it.
+
+Two related jobs, both about the length of a conversation rather than its
+content:
+
+* **Checkpointing.** One ``AsyncSqliteSaver`` is created on first use and shared
+  by every agent in the process. Sharing matters: it is what lets a /ask turn and
+  a /plan worker each resume their own thread, and what makes ``close_checkpointer``
+  a single shutdown step rather than one per agent.
+* **Summarisation.** Once a thread passes a token threshold, older messages are
+  replaced with a summary so a long conversation stays affordable. This is a
+  middleware, so LangGraph applies it as part of the run rather than Terminus
+  having to trim history itself.
+
+The aiosqlite connection runs its own worker thread. It is non-blocking only
+while the process is alive, so ``close_checkpointer`` must be awaited on shutdown
+or the thread is left dangling.
+"""
+
 import aiosqlite
 from terminus.llm.factory import get_llm
 from langchain.agents.middleware import SummarizationMiddleware

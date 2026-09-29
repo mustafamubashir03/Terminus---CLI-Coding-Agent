@@ -207,7 +207,7 @@ def test_second_process_is_refused_and_changes_no_task_state(store):
     pid = seed(store)
     # A task mid-flight, exactly as a real orchestrator would leave it.
     store.claim_task(pid, "task__001")
-    before = {r["id"]: r["status"] for r in store._get_all_tasks(pid)}
+    before = {r["id"]: r["status"] for r in store.get_all_tasks(pid)}
     assert before["task__001"] == "in_progress"
 
     lock_dir = lock_dir_for(store.db_path)
@@ -221,7 +221,7 @@ def test_second_process_is_refused_and_changes_no_task_state(store):
         assert "already being orchestrated" in str(exc.value)
         assert not holds_project_ownership(pid)
 
-        after = {r["id"]: r["status"] for r in store._get_all_tasks(pid)}
+        after = {r["id"]: r["status"] for r in store.get_all_tasks(pid)}
         assert after == before, "a refused acquisition must not touch task state"
         assert store.get_recovery_cycles(pid) == 0, "recovery must not have run"
     finally:
@@ -240,7 +240,7 @@ def test_refused_continue_does_not_recover_a_live_orchestrators_task(store, caps
         asyncio.run(handle_plan_command("continue"))
         out = capsys.readouterr().out
         assert "already being orchestrated" in out
-        row = store._get_all_tasks(pid)[0]
+        row = store.get_all_tasks(pid)[0]
         assert row["status"] == "in_progress", (
             "the refused process recovered a task that is still running"
         )
@@ -328,7 +328,7 @@ def test_new_owner_can_recover_interrupted_tasks_after_a_crash(store):
     store.claim_task(pid, "task__001")
     store.claim_task(pid, "task__002")
     store.complete_task(pid, "task__002", "done")
-    assert store._get_all_tasks(pid)[0]["status"] == "in_progress"
+    assert store.get_all_tasks(pid)[0]["status"] == "in_progress"
 
     lock_dir = lock_dir_for(store.db_path)
     crashed = Holder(lock_dir, pid, mode="crash")
@@ -347,7 +347,7 @@ def test_new_owner_can_recover_interrupted_tasks_after_a_crash(store):
     # With no owner, acquiring first and then recovering works.
     acquire_project_ownership(store, pid)
     assert store.recover_interrupted_tasks(pid) == 1
-    assert store._get_all_tasks(pid)[0]["status"] == "pending"
+    assert store.get_all_tasks(pid)[0]["status"] == "pending"
     release_project_ownership(pid)
 
 
@@ -399,19 +399,23 @@ def test_ownership_is_acquired_before_recovery(store, monkeypatch):
 
     import terminus.tasks.orchestrator as orch
 
-    real_recover = orch.RecoveryManager.recover
+    real_recover = orch.recover_project
 
-    def spy(self, project_id):
+    def spy(active_store, project_id):
         observed.append(("recover", holds_project_ownership(project_id)))
-        return real_recover(self, project_id)
+        return real_recover(active_store, project_id)
 
-    real_run = orch._run_orchestration
-
-    async def spy_run(s, project_id):
+    async def spy_run(active_store, project_id):
+        # Deliberately does not run the real orchestration. What is under test is
+        # the *ordering* - that ownership is held before recovery and for the
+        # whole run - and proving that does not require dispatching a real
+        # worker, which would make the test depend on a live model and take
+        # minutes. The real loop is covered by
+        # test_owner_can_still_run_max_concurrent_two, which stubs the worker
+        # deliberately.
         observed.append(("execute", holds_project_ownership(project_id)))
-        return await real_run(s, project_id)
 
-    monkeypatch.setattr(orch.RecoveryManager, "recover", spy)
+    monkeypatch.setattr(orch, "recover_project", spy)
     monkeypatch.setattr(orch, "_run_orchestration", spy_run)
     monkeypatch.setattr(orch, "_print_final_summary", lambda *a, **k: None)
 
@@ -426,21 +430,32 @@ def test_ownership_is_acquired_before_recovery(store, monkeypatch):
 
 
 def test_recovery_is_impossible_without_ownership(store):
-    """Bypassing the command layer still cannot silently recover."""
+    """Recovery must be unreachable while another live process owns the project.
+
+    ``recover_project`` on its own has no guard, by design - the command layer
+    owns the ordering. So the guard is asserted where it is relied upon: the
+    ownership scope must refuse to yield at all while the project is contended,
+    which means the recovery body can never run.
+
+    This is asserted by calling the scope rather than by reading the module
+    source and comparing string offsets, which only ever verified that the code
+    still looked a particular way rather than that it still worked.
+    """
     pid = seed(store)
     store.claim_task(pid, "task__001")
     lock_dir = lock_dir_for(store.db_path)
     holder = Holder(lock_dir, pid)
     assert holder.report()["acquired"] is True
     try:
-        # RecoveryManager on its own has no guard; that is why the command layer
-        # owns the ordering. Assert the guard exists where it is relied upon.
         import terminus.tasks.orchestrator as orch
 
-        source = Path(orch.__file__).read_text("utf-8")
-        acquire_at = source.index("acquire_project_ownership(store, project_id)")
-        recover_at = source.index("recovery.recover(project_id)")
-        assert acquire_at < recover_at, "recovery must be preceded by acquisition"
+        with pytest.raises(OwnershipConflict):
+            with orch.project_ownership(store, pid):
+                orch.recover_project(store, pid)
+                pytest.fail("the ownership scope must not yield while contended")
+
+        # Nothing was reset: the task is still as it was left.
+        assert store.get_all_tasks(pid)[0]["status"] == "in_progress"
     finally:
         assert holder.finish() == 0
 
@@ -487,7 +502,7 @@ def test_owner_can_still_run_max_concurrent_two(store, monkeypatch):
     asyncio.run(orch._run_orchestration(store, pid))
 
     assert peak["value"] == 2, f"workers were serialised (peak {peak['value']})"
-    assert all(r["status"] == "completed" for r in store._get_all_tasks(pid))
+    assert all(r["status"] == "completed" for r in store.get_all_tasks(pid))
     release_project_ownership(pid)
 
 
@@ -576,7 +591,7 @@ def test_task_failure_semantics_survive_ownership(store, monkeypatch):
     asyncio.run(orch._run_orchestration(store, pid))
     release_project_ownership(pid)
 
-    row = store._get_all_tasks(pid)[0]
+    row = store.get_all_tasks(pid)[0]
     assert row["status"] == "failed"
     assert row["total_attempts"] == 1
     assert "hard failure" in (row["error"] or "")
@@ -600,7 +615,7 @@ def test_continue_acquires_and_releases_across_the_whole_run(store, monkeypatch)
     asyncio.run(handle_plan_command("continue"))
     assert seen == [True], "worker ran without ownership"
     assert not holds_project_ownership(pid), "ownership outlived the run"
-    assert store._get_all_tasks(pid)[0]["status"] == "completed"
+    assert store.get_all_tasks(pid)[0]["status"] == "completed"
 
 
 def test_second_continue_after_a_clean_run_succeeds(store, monkeypatch):
@@ -618,7 +633,7 @@ def test_second_continue_after_a_clean_run_succeeds(store, monkeypatch):
     asyncio.run(handle_plan_command("continue"))
     store.claim_task(pid, "task__001")  # pretend it was interrupted
     asyncio.run(handle_plan_command("continue"))
-    assert store._get_all_tasks(pid)[0]["status"] == "completed"
+    assert store.get_all_tasks(pid)[0]["status"] == "completed"
 
 
 # ---------------------------------------------------------------------------

@@ -1,167 +1,125 @@
-from langchain_core.documents import Document
-import os
-from langchain_qdrant import QdrantVectorStore, RetrievalMode, FastEmbedSparse
-from qdrant_client import QdrantClient
+"""Hybrid (dense + BM25 sparse) index over the Qdrant store.
 
+Hybrid mode is Qdrant-only, and that is a property of the retriever rather than
+an accident: BM25 sparse vectors are a Qdrant feature here, and Chroma's
+collection has no equivalent. The indexer factory rejects hybrid for any other
+provider so the combination cannot be requested by configuration.
+
+Everything else mirrors the dense indexer - same client helper, same
+incremental path, same legacy-point reporting - so the two differ only in the
+sparse retriever they pass in.
+"""
+
+from __future__ import annotations
+
+from langchain_core.documents import Document
+
+from terminus.context.indexers.code_parser import get_source_files, parse_file
+from terminus.context.indexers import qdrant_client
+from terminus.context.indexers.qdrant_client import collection_name, qdrant_location
+from terminus.context.indexers.qdrant_store import write_documents
+from terminus.context.qdrant_scope import (
+    chunk_metadata,
+    ensure_project_payload_index,
+    ensure_source_payload_index,
+    unscoped_points_present,
+)
 from terminus.observability.logging import get_logger
-from terminus.config import CONFIG
-from terminus.llm.factory import get_embedder
-from terminus.context.indexers.code_parser import get_source_files,parse_file
 
 logger = get_logger(__name__)
 
-RETRIEVAL_MODE_MAP = {
-    "dense": RetrievalMode.DENSE,
-    "sparse": RetrievalMode.SPARSE,
-    "hybrid":RetrievalMode.HYBRID
-}
+SPARSE_MODEL = "Qdrant/bm25"
 
-def get_retrieval_mode()->RetrievalMode:
-    mode = CONFIG["vector_store"].get("retrieval_mode","hybrid")
-    return RETRIEVAL_MODE_MAP.get(mode,RetrievalMode.HYBRID)
 
-def get_or_create_qdrant_hybrid_index(repo_path: str, *, force_reindex: bool = False) -> QdrantVectorStore:
-    """Index the codebase for Hybrid search.
+def _configured_mode() -> str:
+    from terminus.config import CONFIG
 
-    If the collection already has points, an incremental freshness check is
-    performed and only changed/new files are re-indexed.  Pass
-    *force_reindex=True* to wipe and rebuild everything from scratch.
+    return str(CONFIG.get("vector_store", {}).get("retrieval_mode", "hybrid")).lower()
+
+
+def retrieval_mode():
+    """The configured dense/sparse/hybrid mix, as LangChain's enum.
+
+    An unrecognised value resolves to HYBRID rather than raising: the
+    configuration is validated in the indexer factory, so by the time this runs
+    the value is already known-good, and a default here keeps the retrievers
+    usable without re-validating.
     """
-    collection_name = CONFIG["qdrant"]["collection_name"]
-    api_key = os.getenv("QDRANT_API_KEY")
-    if not api_key:
-        logger.error("QDRANT_API_KEY not found in .env file")
-        raise ValueError("QDRANT_API_KEY not found in .env file")
-    cluster_endpoint = os.getenv("CLUSTER_ENDPOINT")
-    if not cluster_endpoint:
-        logger.error("CLUSTER_ENDPOINT not found in .env file")
-        raise ValueError("CLUSTER_ENDPOINT not found in .env file")
-    embedder = get_embedder()
-    retrieval_mode = get_retrieval_mode()
-    timeout = float(CONFIG.get("qdrant", {}).get("timeout_seconds", 5))
-    client = QdrantClient(
-        url=cluster_endpoint,
-        api_key=api_key,
-        timeout=timeout,
-        check_compatibility=False,
+    from langchain_qdrant import RetrievalMode
+
+    return {
+        "dense": RetrievalMode.DENSE,
+        "sparse": RetrievalMode.SPARSE,
+        "hybrid": RetrievalMode.HYBRID,
+    }.get(_configured_mode(), RetrievalMode.HYBRID)
+
+
+def sparse_retriever():
+    """The BM25 sparse embedder.
+
+    Loading it is not free, so callers that search repeatedly should hold onto
+    the result; the retrievers do.
+    """
+    from langchain_qdrant import FastEmbedSparse
+
+    return FastEmbedSparse(model_name=SPARSE_MODEL)
+
+
+def get_or_create_qdrant_hybrid_index(repo_path: str, *, force_reindex: bool = False):
+    """Index the codebase for hybrid dense+sparse search."""
+    name = collection_name()
+    client = qdrant_client.create_qdrant_client()
+    logger.info(
+        "Qdrant hybrid index: collection=%s location=%s mode=%s",
+        name, qdrant_location(), retrieval_mode(),
     )
-    existing = [c.name for c in client.get_collections().collections]
 
-    if collection_name in existing:
-        info = client.get_collection(collection_name=collection_name)
-        if (info.points_count or 0) > 0:
-            if force_reindex:
-                from terminus.context.indexers.reindexer import full_reindex
+    existing = {c.name for c in client.get_collections().collections}
+    if name in existing and (client.get_collection(collection_name=name).points_count or 0) > 0:
+        ensure_project_payload_index(client, name)
+        ensure_source_payload_index(client, name)
+        if unscoped_points_present(client, name):
+            from terminus.context.indexers.semantic_qdrant import _warn_unscoped
 
-                logger.info("Force reindex requested ΓÇö wiping and rebuilding")
-                return full_reindex(repo_path)[0]
+            _warn_unscoped(name)
+        if force_reindex:
+            from terminus.context.indexers.reindexer import full_reindex
 
-            from terminus.context.indexers.reindexer import incremental_reindex
+            logger.info("Force reindex requested - wiping and rebuilding")
+            return full_reindex(repo_path)[0]
+        from terminus.context.indexers.reindexer import incremental_reindex
 
-            vector_store, result = incremental_reindex(repo_path)
-            if result.files_added or result.files_modified or result.files_deleted:
-                logger.info(f"Incremental reindex: {result}")
-            return vector_store
+        store, result = incremental_reindex(repo_path)
+        if result.files_added or result.files_modified or result.files_deleted:
+            logger.info("Incremental reindex: %s", result)
+        return store
 
-    # Collection missing or empty ΓÇö full initial index
-    logger.info(f"Loading codebase from: {repo_path}")
+    logger.info("Loading codebase from: %s", repo_path)
     files = get_source_files(repo_path)
-    docs = []
-
+    documents: list[Document] = []
     for filepath in files:
         try:
             chunks = parse_file(filepath)
-        except (SyntaxError, ValueError) as e:
-            logger.error(f"Skipping {filepath} due to parsing error: {e}")
+        except (SyntaxError, ValueError) as exc:
+            logger.warning("Skipping %s: %s: %s", filepath, "parse", exc)
             continue
         for chunk in chunks:
-            docs.append(Document(
-                page_content=chunk.content,
-                metadata={
-                    "source": chunk.source,
-                    "name": chunk.name,
-                    "type": chunk.type,
-                    "start_line": chunk.start_line,
-                    "end_line": chunk.end_line,
-                },
-            ))
-            logger.debug(f"Embedded and stored {chunk.source}:{chunk.start_line}-{chunk.end_line}")
+            documents.append(Document(page_content=chunk.content, metadata=chunk_metadata(chunk)))
 
-    vector_store = QdrantVectorStore.from_documents(
-        documents=docs,
-        embedding=embedder,
-        sparse_embedding=FastEmbedSparse(model_name="Qdrant/bm25"),
-        retrieval_mode=retrieval_mode,
-        collection_name=collection_name,
-        url=cluster_endpoint,
-        api_key=api_key,
-        batch_size=50,
+    store = write_documents(
+        client, documents, name, sparse_embedding=sparse_retriever()
     )
-
-    # Create manifest so next startup does incremental diff
     from terminus.context.indexers.freshness import Manifest, _now_iso
-
-    # Ensure metadata.source is indexed so future incremental deletions work
-    try:
-        client.create_payload_index(
-            collection_name=collection_name,
-            field_name="metadata.source",
-            field_schema="keyword",
-        )
-    except Exception:
-        pass  # "already exists" is the expected case
 
     manifest = Manifest(repo_path=repo_path, last_full_index=_now_iso())
     manifest.files = Manifest.snapshot_directory(repo_path)
     manifest.save()
-
-    logger.info(
-        f"Hybrid indexing completed. Indexed {len(files)} files "
-        f"into {vector_store.collection_name}"
-    )
-    return vector_store
+    logger.info("Hybrid indexing completed. Indexed %d files into %s", len(files), name)
+    return store
 
 
-def show_qdrant_hybrid_index(vector_store: QdrantVectorStore)->None:
-    """Show the qdrant semantic index stats"""
-    from rich.console import Console
-    console = Console()
-    client = vector_store.client
-    collection_name = CONFIG["qdrant"]["collection_name"]
-    results = client.scroll(collection_name=collection_name, with_payload=True,with_vectors=True)
-    points = results[0]
-    console.print(f"Total points: {len(points)}")
-    
-    for i,point in enumerate(points):
-        payload = point.payload
-        console.print(f"[bold cyan] Chunk {i+1}:[/bold cyan] {payload}")
-        if payload is None:
-            console.print("[yellow]No payload for this point, skipping.[/yellow]")
-            continue
-        console.print(f"File: {payload['metadata']['source']}")
-        console.print(f"Name: {payload['metadata']['name']}")
-        console.print(f"Lines: {payload['metadata']['start_line']}-{payload['metadata']['end_line']}")
-        console.print(
-            f"\n[bold]Code:[/bold]\n"
-            f"[code]{payload.get('page_content', '')[:300]}[/code]...\n"
-        )
+def show_qdrant_hybrid_index(store) -> None:
+    """Print the first chunks in the hybrid index."""
+    from terminus.context.indexers.semantic_qdrant import show_qdrant_semantic_index
 
-        raw_vec = point.vector
-        if isinstance(raw_vec, dict):
-            dense = next((v for v in raw_vec.values() if isinstance(v, list) and v and isinstance(v[0], float)), None)
-            embedding: list[float] | None = dense  # type: ignore[assignment]
-        elif isinstance(raw_vec, list) and raw_vec and isinstance(raw_vec[0], list):
-            embedding = raw_vec[0]  
-        else:
-            embedding = raw_vec  # type: ignore[assignment]
-        if embedding is not None:
-            console.print(
-                f"[bold green]Embedding [{len(embedding)}]: "
-                f"{', '.join(f'{v:.4f}' for v in embedding[:5])} ..."
-            )
-        else:
-            console.print("[yellow]No embedding available for this point.[/yellow]")
-        console.print("-" * 50)
-    
-    
-    
+    show_qdrant_semantic_index(store)

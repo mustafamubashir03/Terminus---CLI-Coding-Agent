@@ -57,7 +57,7 @@ def store(tmp_path) -> TaskStore:
 
 
 def _row(store: TaskStore, pid: str, tid: str = "task__001") -> dict:
-    return next(t for t in store._get_all_tasks(pid) if t["id"] == tid)
+    return next(t for t in store.get_all_tasks(pid) if t["id"] == tid)
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +213,7 @@ def test_attempts_persist_across_a_store_reopen(tmp_path):
     # a new process would open the same file afresh
     second = TaskStore(db)
     assert second.claim_task(pid, "task__001") == 2
-    row = next(t for t in second._get_all_tasks(pid) if t["id"] == "task__001")
+    row = next(t for t in second.get_all_tasks(pid) if t["id"] == "task__001")
     # total_attempts counts every attempt *started*, so two claims = 2
     assert row["total_attempts"] == 2, "the history survived the restart"
     assert row["retry_count"] == 1, "one failure was spent in this cycle"

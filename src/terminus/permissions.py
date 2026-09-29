@@ -26,7 +26,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Iterable
+from typing import Callable
+from collections.abc import Iterable
 
 
 class PermissionLevel(str, Enum):
@@ -57,12 +58,16 @@ class Operation(str, Enum):
 
     @property
     def label(self) -> str:
-        return {
-            "read": "read",
-            "write": "write",
-            "delete": "delete",
-            "execute": "execute",
-        }[self.value]
+        return self.value
+
+
+#: The level each operation inherently requires. EXECUTE is absent because its
+#: level comes from the command text, not from the operation name.
+_OPERATION_LEVELS: dict[Operation, PermissionLevel] = {
+    Operation.READ: PermissionLevel.READ_ONLY,
+    Operation.WRITE: PermissionLevel.WRITE,
+    Operation.DELETE: PermissionLevel.DESTRUCTIVE,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +82,7 @@ READ_ONLY_COMMANDS = frozenset({
     "grep", "egrep", "fgrep", "rg", "ag", "ack", "find", "fd", "tree",
     "diff", "cmp", "sort", "uniq", "cut", "tr", "nl", "jq", "yq", "less",
     "more", "column", "od", "xxd", "hexdump", "true", "false", "man", "help",
-    "whereis", "getent", "ps", "wmic", "systeminfo", "ver", "uname",
+    "whereis", "getent", "ps", "wmic", "systeminfo", "ver",
 })
 
 # Commands that are only read-only in certain sub-argument shapes, matched as
@@ -497,17 +502,13 @@ def classify_operation(operation: Operation, command: str | None = None) -> Perm
     """Level required by an operation.
 
     EXECUTE defers to the shell classifier, so command-level knowledge stays in
-    one place; the other levels are inherent to the operation itself.
+    one place. Anything not in the table - which today means only EXECUTE, and
+    tomorrow only whatever is added without a level - is treated as needing
+    WRITE, the conservative default.
     """
-    if operation is Operation.READ:
-        return PermissionLevel.READ_ONLY
-    if operation is Operation.WRITE:
-        return PermissionLevel.WRITE
-    if operation is Operation.DELETE:
-        return PermissionLevel.DESTRUCTIVE
     if operation is Operation.EXECUTE:
         return classify_command(command or "")
-    return PermissionLevel.WRITE
+    return _OPERATION_LEVELS.get(operation, PermissionLevel.WRITE)
 
 
 def describe_operation(operation: Operation, target: str = "",
@@ -520,8 +521,13 @@ def describe_operation(operation: Operation, target: str = "",
     return operation.label
 
 
+#: The fail-closed default: read-only, no approver. Frozen so the shared
+#: instance cannot be mutated by one execution and observed by another; a caller
+#: that needs different authority constructs its own policy and installs it.
+_DEFAULT_POLICY = PermissionPolicy()
+
 _policy: ContextVar[PermissionPolicy] = ContextVar(
-    "terminus_permission_policy", default=PermissionPolicy()
+    "terminus_permission_policy", default=_DEFAULT_POLICY
 )
 """The policy in force for the *current execution*.
 

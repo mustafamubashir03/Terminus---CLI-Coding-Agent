@@ -338,6 +338,60 @@ class UsageCallbackHandler(BaseCallbackHandler):
 _global_summary = UsageSummary()
 _summary_lock = threading.Lock()
 
+# Delegation lifecycle events, kept beside the model-usage summary so there is
+# one place to look at what a run cost. Bounded: one entry per child, trimmed on
+# insert, because a long session must not grow this without limit.
+CHILD_EVENT_LIMIT = 200
+_child_events: list[dict] = []
+
+
+def record_child_event(
+    *,
+    parent_agent_id: str | None = None,
+    child_agent_id: str = "",
+    role: str = "",
+    status: str = "",
+    skills: list | None = None,
+    tools: list | None = None,
+    duration_seconds: float = 0.0,
+    failure_category: str | None = None,
+) -> None:
+    """Record one delegated-child lifecycle event.
+
+    Metadata only. No prompt, no task text and no child output: a subagent's
+    answer routinely contains source code, and that does not belong in telemetry.
+
+    This is an event log, not a second observability stack - it shares the
+    module and the lock discipline of the usage summary beside it.
+    """
+    with _summary_lock:
+        _child_events.append({
+            "parent_agent_id": parent_agent_id or "",
+            "child_agent_id": child_agent_id,
+            "role": role,
+            "status": status,
+            "skills": list(skills or []),
+            "tools": list(tools or []),
+            "duration_seconds": round(float(duration_seconds), 3),
+            "failure_category": failure_category,
+        })
+        if len(_child_events) > CHILD_EVENT_LIMIT:
+            del _child_events[: len(_child_events) - CHILD_EVENT_LIMIT]
+
+
+def get_child_events() -> list[dict]:
+    """The recorded delegation events, oldest first."""
+    with _summary_lock:
+        return list(_child_events)
+
+
+def clear_child_events() -> None:
+    _summary_lock.acquire()
+    try:
+        _child_events.clear()
+    finally:
+        _summary_lock.release()
+
 
 def record(_records: list[CallRecord], kind: str | None = None) -> None:
     """Absorb a handler's records into the global summary."""

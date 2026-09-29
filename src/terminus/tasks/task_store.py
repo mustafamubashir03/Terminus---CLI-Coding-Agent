@@ -1,12 +1,37 @@
-import time
-from enum import Enum
-from pathlib import Path
-from terminus.observability.logging import get_logger
+"""SQLite persistence for projects and the tasks inside them.
+
+This is the single owner of task state. The scheduler claims work here, the
+worker reports outcomes here, and the CLI reads status from here, so there is one
+place where a task's status, attempt counts and result text are decided rather
+than one per caller.
+
+Two invariants worth knowing before changing anything here:
+
+* **Claiming is atomic.** ``claim_task`` performs the pending -> in_progress
+  transition and increments ``total_attempts`` in a single statement, so the
+  attempt number the scheduler reports and the attempt the worker is running can
+  never disagree, and two orchestrators cannot both start the same task.
+* **Two attempt counters, on purpose.** ``retry_count`` is spent attempts in the
+  current recovery cycle and is what the automatic retry budget is measured
+  against. ``total_attempts`` counts every attempt ever started and is never
+  reset, so a task's real history survives any number of ``/plan continue``
+  cycles. Conflating them would make the automatic budget either unbounded or
+  permanently exhausted.
+
+The schema is created on construction and migrated in place, so an existing
+``.terminus/tasks/tasks.db`` from an older Terminus keeps working.
+"""
+
 import json
 import os
-import uuid
 import sqlite3
+import time
+import uuid
 from contextlib import contextmanager
+from enum import Enum
+from pathlib import Path
+
+from terminus.observability.logging import get_logger
 from terminus.tasks.errors import _NON_RETRYABLE_PREFIXES
 
 logger = get_logger(__name__)
@@ -110,6 +135,22 @@ def bounded_result(text: str) -> str:
         f"showing the first {head} and last {tail}]\n"
         f"{text[-tail:]}"
     )
+
+def _strip_retry_prefix(error: str) -> str:
+    """Remove the caller's retryability tag from a stored error message.
+
+    ``_run_orchestration`` prefixes the error with ``[retryable]`` or
+    ``[non-retryable]`` so the log line reads clearly. That prefix is redundant in
+    the stored column, which records the outcome in its own ``[failed]`` /
+    ``[retry-exhausted]`` tag, so keeping both left the column reading
+    ``[failed] [non-retryable] ...``.
+    """
+    text = error or ""
+    for prefix in _NON_RETRYABLE_PREFIXES:
+        if text.startswith(prefix):
+            return text[len(prefix):]
+    return text
+
 
 class TaskStore:
     def __init__(self, db_path:str="tasks.db"):
@@ -290,7 +331,13 @@ class TaskStore:
                 for row in rows
             )
 
-    def _get_all_tasks(self, project_id: str) -> list:
+    def get_all_tasks(self, project_id: str) -> list[dict]:
+        """Every task in *project_id*, with its full state.
+
+        Named publicly because the orchestrator reports on failed tasks to the
+        user and was reaching past the store's interface into ``get_all_tasks``
+        to do it. One accessor, one owner of the query.
+        """
         with self.conn() as conn:
             rows = conn.execute(
                 """
@@ -358,7 +405,7 @@ class TaskStore:
                         ),
                     )
                     skipped_placeholders += 1
-                    logger.info(f"Skipping placeholder task {pt.id} '{pt.title}'")
+                    logger.info("Skipping placeholder task %s '%s'", pt.id, pt.title)
                     continue
                 conn.execute(
                     """INSERT INTO tasks(id, project_id, title, description, task_type, depends_on, output_files, acceptance_criteria, execution_order) VALUES(?,?,?,?,?,?,?,?,?)""",
@@ -412,6 +459,24 @@ class TaskStore:
             if row:
                 return row[0]
         return None
+
+    def get_project(self, project_id: str) -> dict | None:
+        """Return one project row, or None.
+
+        Read-only accessor for the project-context read model. ``plan_json`` is
+        returned raw and unparsed: TaskStore stores what the planner produced and
+        does not get a say in how a caller chooses to read it.
+        """
+        with self.conn() as conn:
+            row = conn.execute(
+                """
+                SELECT id, name, goal, plan_json, status, created_at, workspace,
+                       recovery_cycles
+                FROM projects WHERE id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+            return dict(row) if row else None
 
     def get_project_workspace(self, project_id: str) -> str | None:
         """The project directory a project was created for, or None if unknown."""
@@ -549,7 +614,7 @@ class TaskStore:
         recovery explanation the full chain, e.g. A -> B -> C with A failed reports
         both B (blocked by A) and C (blocked by A).
         """
-        tasks = self._get_all_tasks(project_id)
+        tasks = self.get_all_tasks(project_id)
         status_by_id = {t["id"]: t["status"] for t in tasks}
         dep_by_id: dict[str, list[str]] = {}
         for t in tasks:
@@ -717,24 +782,22 @@ class TaskStore:
                     ),
                 )
                 logger.warning(
-                    f"Task {task_id} failed, retry {new_retry_count}/{max_retries} "
-                    f"(attempt {total_attempts} overall): {error[:200]}"
+                    "Task %s failed, retry %s/%s (attempt %s overall): %s",
+                    task_id, new_retry_count, max_retries, total_attempts, error[:200],
                 )
                 return TaskStatus.PENDING.value
 
-            persist_error = error
-            if not force:
-                for prefix in _NON_RETRYABLE_PREFIXES:
-                    if persist_error.startswith(prefix):
-                        persist_error = persist_error[len(prefix):]
-                        break
-                persist_error = "[retry-exhausted] [retryable] " + persist_error
-            else:
-                for prefix in _NON_RETRYABLE_PREFIXES:
-                    if persist_error.startswith(prefix):
-                        persist_error = persist_error[len(prefix):]
-                        break
-                persist_error = "[failed] " + persist_error
+            # The stored error is re-tagged rather than the raw text kept, so the
+            # row itself says whether the failure was retried to exhaustion or
+            # refused outright. The prefix the caller attached is stripped first:
+            # it is already encoded in the tag, and keeping both made the column
+            # read "[failed] [non-retryable] ...".
+            persist_error = _strip_retry_prefix(error)
+            persist_error = (
+                f"[retry-exhausted] [retryable] {persist_error}"
+                if not force
+                else f"[failed] {persist_error}"
+            )
             conn.execute(
                 """
                 UPDATE tasks
@@ -745,8 +808,9 @@ class TaskStore:
                  new_retry_count, project_id, task_id),
             )
             logger.error(
-                f"Task {task_id} permanently failed after {new_retry_count} attempts "
-                f"in this cycle ({total_attempts} overall): {persist_error[:200]}"
+                "Task %s permanently failed after %s attempts in this cycle "
+                "(%s overall): %s",
+                task_id, new_retry_count, total_attempts, persist_error[:200],
             )
             return TaskStatus.FAILED.value
 

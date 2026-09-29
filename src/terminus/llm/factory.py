@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import importlib
 import inspect
 import os
 from pathlib import Path
 from typing import Any
 
+from langchain_cohere import ChatCohere
 from langchain_openai import ChatOpenAI
 
 from terminus.cache import cache_llm_client, get_cached_llm_client, llm_cache_key
 from terminus.config import CONFIG, CONFIG_SOURCE, CONFIG_SOURCE_KIND
 from terminus.env import load_project_env
+from terminus.llm import providers
 from terminus.llm.fallback import FallbackChatModel
 from terminus.observability.logging import get_logger
 
@@ -110,36 +113,56 @@ def _track(client: Any) -> None:
         _active_llm_clients.append(client)
 
 
-async def _close_object(value: Any) -> None:
-    if value is None:
-        return
-    for name in ("root_async_client", "async_client", "client", "primary", "fallback"):
-        try:
-            child = getattr(value, name)
-        except Exception:
-            continue
-        if child is value:
-            continue
-        await _close_object(child)
+async def _aclose(obj: Any) -> None:
+    """Close one object if it has a close hook, sync or async.
+
+    Provider SDKs disagree on the name - ``aclose`` on an async client, ``close``
+    on a sync one - so both are tried, and the first callable wins.
+    """
     for name in ("aclose", "close"):
-        close = getattr(value, name, None)
+        close = getattr(obj, name, None)
         if not callable(close):
             continue
         try:
             result = close()
             if inspect.isawaitable(result):
                 await result
-            return
         except Exception as exc:
-            logger.debug("LLM client close skipped: %s", type(exc).__name__)
-            return
+            # Shutdown is best-effort: one client that will not close must not
+            # strand the rest. The exception is not actionable to the user, so
+            # it stays at debug level.
+            logger.debug("LLM client close skipped: %s: %s", type(exc).__name__, exc)
+        return
+
+
+#: Attributes on a LangChain chat client that hold an HTTP transport we opened.
+#: Named explicitly rather than discovered: a client we did not build is not our
+#: object to walk, and guessing at attribute names is how the previous version
+#: ended up recursing into arbitrary internals. ``FallbackChatModel`` needs no
+#: entry - it wraps only clients that are tracked in their own right, so it is
+#: never in the registry.
+_TRANSPORT_ATTRS = ("root_async_client", "async_client", "client")
+
+
+async def _close_llm_client(client: Any) -> None:
+    """Close a provider client and the transport underneath it."""
+    for attr in _TRANSPORT_ATTRS:
+        transport = getattr(client, attr, None)
+        if transport is not None and transport is not client:
+            await _aclose(transport)
+    await _aclose(client)
 
 
 async def aclose_llm_clients() -> None:
+    """Close every LLM client this process built.
+
+    Called on shutdown. Clients are tracked individually at construction, so
+    this walks a flat list rather than trying to rediscover a graph.
+    """
     clients = list(_active_llm_clients)
     _active_llm_clients.clear()
     for client in clients:
-        await _close_object(client)
+        await _close_llm_client(client)
 
 
 def get_llm_config() -> dict[str, Any]:
@@ -157,156 +180,227 @@ def get_llm_config() -> dict[str, Any]:
 
 
 def _provider_endpoint(provider: str) -> str:
-    return {
-        "openrouter": "https://openrouter.ai/api/v1/chat/completions",
-        "google_genai": "https://generativelanguage.googleapis.com/v1beta",
-        "google": "https://generativelanguage.googleapis.com/v1beta",
-        "openai": "https://api.openai.com/v1/chat/completions",
-    }.get(provider.lower(), "provider-defined")
+    """The provider's request URL, for diagnostics only.
+
+    Read from the provider table so it cannot disagree with what the builder
+    actually points a client at.
+    """
+    spec = providers.get(provider)
+    return spec.endpoint if spec else "provider-defined"
 
 
 def _api_kind(provider: str) -> str:
-    if provider.lower() == "openrouter":
-        return "chat_completions"
-    if provider.lower() in {"google_genai", "google"}:
-        return "google_generate_content"
-    return "provider-defined"
+    spec = providers.get(provider)
+    return spec.api_kind if spec else "provider-defined"
 
 
-def _build_model_direct(model: str, provider: str, cfg: dict[str, Any]):
-    _load_dotenv()
-    provider_lower = provider.lower()
+# Groq publishes reasoning levels per model, and a value a model does not
+# accept is a hard 400 rather than something it quietly ignores. Discovered
+# live from GET https://api.groq.com/openai/v1/models on 2026-09-28; only the
+# levels documented for each model are ever sent, and an unknown model sends
+# nothing rather than guessing.
+GROQ_REASONING_EFFORTS: dict[str, frozenset[str]] = {
+    "openai/gpt-oss-20b": frozenset({"low", "medium", "high"}),
+    "openai/gpt-oss-120b": frozenset({"low", "medium", "high"}),
+    "qwen/qwen3.8-27b": frozenset(
+        {"none", "default", "minimal", "low", "medium", "high", "xhigh", "max"}
+    ),
+}
 
-    if provider_lower == "fireworks":
-        from langchain_fireworks import ChatFireworks
+GROQ_BASE_URL = providers.get("groq").base_url
+"""Groq's documented OpenAI-compatible base URL.
 
-        api_key = os.environ.get("FIREWORKS_API_KEY")
-        if not api_key:
-            raise ValueError("FIREWORKS_API_KEY is not set")
-        client = ChatFireworks(
-            model=f"accounts/fireworks/models/{model}",
-            temperature=0,
-            timeout=cfg["timeout"],
-            max_retries=cfg["max_retries"],
+Read from the provider table, so the URL a client is built against and the URL
+reported in diagnostics cannot drift apart.
+
+Groq is OpenAI-compatible, so the whole provider is a ``ChatOpenAI`` pointed at
+this base URL - no separate SDK and no separate client type. Chat Completions is
+used rather than Groq's Responses API because Chat Completions is what the rest
+of Terminus is built on (tool calling, streaming, async), and Groq documents
+Responses as beta.
+"""
+
+
+def _groq_reasoning_effort(cfg: dict[str, Any], model: str) -> str | None:
+    """Map Terminus's configured reasoning effort onto a Groq level.
+
+    Terminus already carries an OpenRouter-shaped ``reasoning.effort``. Groq
+    wants a bare ``reasoning_effort`` string, and only some levels, so this
+    returns None whenever the value is not documented for the selected model -
+    the caller then sends no reasoning parameter at all rather than a rejected
+    one.
+    """
+    reasoning = cfg.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return None
+    effort = str(reasoning.get("effort") or "").strip().lower()
+    if not effort:
+        return None
+    supported = GROQ_REASONING_EFFORTS.get(model)
+    if supported is None or effort not in supported:
+        logger.warning(
+            "Not sending reasoning_effort=%s to Groq model %s: not a documented "
+            "level for that model. Supported: %s",
+            effort,
+            model,
+            ", ".join(sorted(supported)) if supported else "unknown model",
         )
-        _track(client)
-        return client
+        return None
+    return effort
 
-    if provider_lower == "openai":
-        from langchain_openai import ChatOpenAI
 
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY is not set")
-        client = ChatOpenAI(
-            model=model,
-            api_key=api_key,
-            timeout=cfg["timeout"],
-            max_retries=cfg["max_retries"],
-        )
-        _track(client)
-        return client
+def _require_key(provider: str, spec: providers.Provider) -> str:
+    """The first of *provider*'s credential variables that is set.
 
-    if provider_lower == "cerebras":
-        from langchain_cerebras import ChatCerebras
+    Raises naming every accepted variable, because "the key is missing" is only
+    actionable if the user is told which key to set.
+    """
+    import os
 
-        api_key = os.environ.get("CEREBRAS_API_KEY")
-        if not api_key:
-            raise ValueError("CEREBRAS_API_KEY is not set")
-        client = ChatCerebras(
-            model=model,
-            api_key=api_key,
-            timeout=cfg["timeout"],
-            max_retries=cfg["max_retries"],
-        )
-        _track(client)
-        return client
+    for name in spec.env_keys:
+        value = os.environ.get(name)
+        if value:
+            return value
+    accepted = " or ".join(spec.env_keys) if spec.env_keys else spec.name
+    raise ValueError(f"{accepted} is not set")
 
-    if provider_lower == "anthropic":
-        from langchain_anthropic import ChatAnthropic
 
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY is not set")
-        client = ChatAnthropic(
-            model=model,
-            api_key=api_key,
-            timeout=cfg["timeout"],
-            max_retries=cfg["max_retries"],
-        )
-        _track(client)
-        return client
+def _build_openai_compatible(model: str, spec: providers.Provider, cfg: dict[str, Any]):
+    """A ChatOpenAI pointed at an OpenAI-compatible endpoint.
 
-    if provider_lower == "openrouter":
-        api_key = os.environ.get("OPENROUTER_API_KEY")
-        if not api_key:
-            raise ValueError("OPENROUTER_API_KEY is not set")
-        extra_body: dict[str, Any] = {}
+    Covers OpenRouter and Groq, which both document the OpenAI wire format. The
+    provider-specific part is only the body fields each one wants, so the client
+    construction is shared rather than copy-pasted per vendor.
+    """
+    api_key = _require_key(spec.name, spec)
+    extra_body: dict[str, Any] = {}
+    if spec.name == "openrouter":
         if cfg.get("reasoning"):
             extra_body["reasoning"] = cfg["reasoning"]
         if cfg.get("include_reasoning", True):
             extra_body["include_reasoning"] = True
-        client = _OpenRouterChatModel(
-            model=model,
-            api_key=api_key,
-            base_url="https://openrouter.ai/api/v1",
-            timeout=cfg["timeout"],
-            max_retries=cfg["max_retries"],
-            temperature=0,
-            streaming=cfg.get("streaming", False),
-            use_responses_api=False,
-            extra_body=extra_body or None,
-        )
-        _track(client)
-        return client
+    else:  # groq
+        effort = _groq_reasoning_effort(cfg, model)
+        if effort:
+            extra_body["reasoning_effort"] = effort
 
-    if provider_lower in {"google_genai", "google"}:
-        from google import genai
-        from google.genai import types
-        from langchain_google_genai import ChatGoogleGenerativeAI
+    cls = _OpenRouterChatModel if spec.name == "openrouter" else ChatOpenAI
+    return cls(
+        model=model,
+        api_key=api_key,
+        base_url=spec.base_url,
+        timeout=cfg["timeout"],
+        max_retries=cfg["max_retries"],
+        temperature=0,
+        streaming=cfg.get("streaming", False),
+        # Chat Completions throughout. Groq documents its Responses API as beta,
+        # and OpenRouter's reasoning_details handling is built on this format.
+        use_responses_api=False,
+        extra_body=extra_body or None,
+    )
 
-        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY or GOOGLE_API_KEY is not set")
-        google_client = genai.Client(
-            api_key=api_key,
-            http_options=types.HttpOptions(
-                retry_options=types.HttpRetryOptions(attempts=1)
-            ),
-        )
-        client = ChatGoogleGenerativeAI(
-            model=model,
-            api_key=api_key,
-            client=google_client,
-            vertexai=False,
-            request_timeout=cfg["timeout"],
-            streaming=cfg.get("streaming", False),
-        )
-        _track(client)
-        return client
 
-    if provider_lower == "cohere":
-        from langchain_cohere import ChatCohere
+def _build_google(model: str, spec: providers.Provider, cfg: dict[str, Any]):
+    from google import genai
+    from google.genai import types
+    from langchain_google_genai import ChatGoogleGenerativeAI
 
-        class _CohereChatModel(ChatCohere):
-            def bind_tools(self, tools, **kwargs):
-                if kwargs.get("tool_choice") in ("any", "auto"):
-                    kwargs["tool_choice"] = "REQUIRED"
-                return super().bind_tools(tools, **kwargs)
+    api_key = _require_key(spec.name, spec)
+    google_client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(
+            retry_options=types.HttpRetryOptions(attempts=1)
+        ),
+    )
+    return ChatGoogleGenerativeAI(
+        model=model,
+        api_key=api_key,
+        client=google_client,
+        vertexai=False,
+        request_timeout=cfg["timeout"],
+        streaming=cfg.get("streaming", False),
+    )
 
-        api_key = os.environ.get("COHERE_API_KEY")
-        if not api_key:
-            raise ValueError("COHERE_API_KEY is not set")
-        client = _CohereChatModel(
-            model=model,
-            api_key=api_key,
-            timeout_seconds=cfg["timeout"],
-            max_retries=cfg["max_retries"],
-        )
-        _track(client)
-        return client
 
-    raise ValueError(f"Unknown LLM provider: {provider}")
+class _CohereChatModel(ChatCohere):
+    """Cohere, with its tool-choice vocabulary mapped onto OpenAI's.
+
+    Cohere rejects ``"any"``/``"auto"`` and wants ``"REQUIRED"``. Without this the
+    agent's tool loop fails at the first call on a Cohere route.
+    """
+
+    def bind_tools(self, tools, **kwargs):
+        if kwargs.get("tool_choice") in ("any", "auto"):
+            kwargs["tool_choice"] = "REQUIRED"
+        return super().bind_tools(tools, **kwargs)
+
+
+def _build_cohere(model: str, spec: providers.Provider, cfg: dict[str, Any]):
+    return _CohereChatModel(
+        model=model,
+        api_key=_require_key(spec.name, spec),
+        timeout_seconds=cfg["timeout"],
+        max_retries=cfg["max_retries"],
+    )
+
+
+def _build_langchain(model: str, spec: providers.Provider, cfg: dict[str, Any]):
+    """The providers with a first-class LangChain integration, but no quirks.
+
+    These four differ from each other only in SDK name and key, so the builder
+    takes both from the table instead of carrying a near-identical branch each.
+    """
+    api_key = _require_key(spec.name, spec)
+    module_name, class_name = {
+        "fireworks": ("langchain_fireworks", "ChatFireworks"),
+        "cerebras": ("langchain_cerebras", "ChatCerebras"),
+        "anthropic": ("langchain_anthropic", "ChatAnthropic"),
+        "openai": ("langchain_openai", "ChatOpenAI"),
+    }[spec.name]
+    cls = getattr(importlib.import_module(module_name), class_name)
+    if spec.name == "fireworks":
+        # Fireworks namespaces its models under the owning account.
+        model = f"accounts/fireworks/models/{model}"
+    return cls(
+        model=model,
+        api_key=api_key,
+        timeout=cfg["timeout"],
+        max_retries=cfg["max_retries"],
+    )
+
+
+#: name -> builder. A provider missing from here is constructed by
+#: ``init_chat_model`` instead, which is why this is not the whole list.
+_BUILDERS = {
+    "openrouter": _build_openai_compatible,
+    "groq": _build_openai_compatible,
+    "google_genai": _build_google,
+    "google": _build_google,
+    "cohere": _build_cohere,
+    "fireworks": _build_langchain,
+    "cerebras": _build_langchain,
+    "anthropic": _build_langchain,
+    "openai": _build_langchain,
+}
+
+
+def _build_model_direct(model: str, provider: str, cfg: dict[str, Any]):
+    """Build a client for *provider* without consulting LangChain's factory.
+
+    Used for the providers whose wire format or credentials need handling of our
+    own, and as the fallback when ``init_chat_model`` does not recognise a
+    provider name.
+    """
+    _load_dotenv()
+    spec = providers.get(provider)
+    if spec is None:
+        raise ValueError(f"Unknown LLM provider: {provider}")
+    builder = _BUILDERS.get(spec.name)
+    if builder is None:
+        raise ValueError(f"Unknown LLM provider: {provider}")
+    client = builder(model, spec, cfg)
+    _track(client)
+    return client
 
 
 def _fallback_specs() -> list[tuple[str, str]]:
@@ -363,7 +457,10 @@ def _with_fallback(
             primary_attempts=max(1, int(cfg.get("route_max_attempts", 2))),
             backoff_seconds=max(0.0, float(cfg.get("route_backoff_seconds", 5))),
         )
-        _track(routed)
+        # The wrapper is deliberately not tracked. It holds only the clients
+        # built above, and each of those was tracked when it was constructed, so
+        # tracking the wrapper as well would mean closing the same transports
+        # twice and would force shutdown to rediscover its own structure.
     return routed
 
 
@@ -386,7 +483,7 @@ def get_chat_model(model: str, model_provider: str | None = None):
         return cached
 
     _set_current_labels(model, provider)
-    if provider.lower() in {"cohere", "openrouter", "google_genai", "google"}:
+    if provider.lower() in {"cohere", "openrouter", "google_genai", "google", "groq"}:
         client = _build_model_direct(model, provider, cfg)
     else:
         try:
@@ -416,21 +513,40 @@ def _role_model(role: str) -> str:
 
 def get_provider_diagnostics(role: str = "executor") -> dict[str, Any]:
     _load_dotenv()
+    import time as _time
+
+    from terminus.llm.fallback import provider_exhausted_until
+
     llm = CONFIG.get("llm", {})
     provider = str(llm.get("provider", ""))
     fallbacks = _fallback_specs()
-    key_names = (
-        "OPENROUTER_API_KEY",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-        "OPENAI_API_KEY",
-        "FIREWORKS_API_KEY",
-        "CEREBRAS_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "COHERE_API_KEY",
-        "QDRANT_API_KEY",
-        "CLUSTER_ENDPOINT",
-    )
+    cfg = get_llm_config()
+
+    def _status(name: str) -> str:
+        deadline = provider_exhausted_until(name)
+        if deadline is None:
+            return "available"
+        return f"exhausted, usable again in {max(0.0, deadline - _time.time()):.0f}s"
+
+    def _route(name: str) -> dict[str, Any]:
+        spec = providers.get(name)
+        entry: dict[str, Any] = {
+            "provider": name,
+            "endpoint": _provider_endpoint(name),
+            "api_kind": _api_kind(name),
+            # Presence only. The secret itself is never placed in diagnostics.
+            "api_key_configured": (
+                any(os.environ.get(key) for key in spec.env_keys)
+                if spec and spec.env_keys
+                else None
+            ),
+            "status": _status(name),
+        }
+        if name.lower() == "groq":
+            entry["base_url"] = spec.base_url
+            entry["available_models"] = sorted(GROQ_REASONING_EFFORTS)
+        return entry
+
     return {
         "config_source": str(CONFIG_SOURCE) if CONFIG_SOURCE else None,
         "config_source_kind": CONFIG_SOURCE_KIND,
@@ -447,7 +563,10 @@ def get_provider_diagnostics(role: str = "executor") -> dict[str, Any]:
         },
         "endpoint": _provider_endpoint(provider),
         "api_kind": _api_kind(provider),
-        "streaming": bool(get_llm_config()["streaming"]),
+        "streaming": bool(cfg["streaming"]),
+        # `fallback` and `fallback_endpoint` are the first entry of `fallbacks`,
+        # kept as a convenience for callers that only care where Terminus goes
+        # when the primary route is unavailable.
         "fallback": (
             {"provider": fallbacks[0][0], "model": fallbacks[0][1]}
             if fallbacks
@@ -458,39 +577,33 @@ def get_provider_diagnostics(role: str = "executor") -> dict[str, Any]:
             for p, m in fallbacks
         ],
         "fallback_endpoint": _provider_endpoint(fallbacks[0][0]) if fallbacks else None,
+        "primary_route": _route(provider),
+        "fallback_routes": [_route(p) for p, _m in fallbacks],
+        "exhausted_providers": {
+            name: _status(name)
+            for name in sorted({provider, *(p for p, _ in fallbacks)})
+            if provider_exhausted_until(name) is not None
+        },
         "vector_store": {
             "provider": CONFIG.get("vector_store", {}).get("provider"),
             "mode": CONFIG.get("rag", {}).get("mode"),
             "fallback": CONFIG.get("_runtime", {}).get("indexer_fallback"),
         },
         "retry_policy": {
-            "sdk_max_retries": get_llm_config()["max_retries"],
-            "route_max_attempts": get_llm_config()["route_max_attempts"],
-            "route_backoff_seconds": get_llm_config()["route_backoff_seconds"],
+            "sdk_max_retries": cfg["max_retries"],
+            "route_max_attempts": cfg["route_max_attempts"],
+            "route_backoff_seconds": cfg["route_backoff_seconds"],
         },
-        "credential_presence": {name: bool(os.environ.get(name)) for name in key_names},
+        "credential_presence": {
+            name: bool(os.environ.get(name))
+            for name in providers.credential_env_names()
+        },
     }
 
 
 def format_provider_diagnostics() -> str:
     data = get_provider_diagnostics()
-    lines = [
-        f"Provider: {data['provider']}",
-        f"Requested model ({data['role']}): {data['requested_model']}",
-        f"Models: {data['models']}",
-        f"Endpoint: {data['endpoint']}",
-        f"API kind: {data['api_kind']}",
-        f"Streaming: {data['streaming']}",
-        f"Configuration source: {data['config_source']} ({data['config_source_kind']})",
-        f"Runtime source: {data['runtime_source']}",
-        f"Fallback: {data['fallback']}",
-        f"Fallback chain: {data['fallbacks']}",
-        f"Fallback endpoint: {data['fallback_endpoint']}",
-        f"Vector store: {data['vector_store']}",
-        f"Retry policy: {data['retry_policy']}",
-        f"Credential presence: {data['credential_presence']}",
-    ]
-    return "\n".join(lines)
+    return "\n".join(f"{key.replace('_', ' ')}: {value}" for key, value in data.items())
 
 
 def get_embedder():

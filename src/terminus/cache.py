@@ -15,7 +15,8 @@ here is only for callers that own their own retry policy.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable, Awaitable
+from typing import Any, Callable
+from collections.abc import Awaitable
 
 from terminus.observability.logging import get_logger
 

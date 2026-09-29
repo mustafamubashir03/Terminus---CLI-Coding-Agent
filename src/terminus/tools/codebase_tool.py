@@ -1,8 +1,10 @@
-from terminus.context.retrievers.factory import get_retriever
 from langchain.tools import tool
+
+from terminus.context.retrievers.factory import get_retriever
 from terminus.observability.logging import get_logger
 
 logger = get_logger(__name__)
+
 
 @tool
 def search_codebase(query: str) -> str:
@@ -22,7 +24,9 @@ def search_codebase(query: str) -> str:
     except Exception as exc:
         # Semantic search is an accelerator, not the source of truth. A broken or
         # unreachable vector store must not end the turn: report it and let the
-        # model continue with grep / read_file / list_directory.
+        # model continue with grep / read_file / list_directory. The configured
+        # backend is not substituted here - that decision was already made, and
+        # reported, when the index was built.
         logger.warning("Semantic search unavailable: %s: %s", type(exc).__name__, exc)
         return (
             "Semantic search is currently unavailable "
@@ -40,9 +44,6 @@ def search_codebase(query: str) -> str:
             f"File: {chunk['source']} (lines {chunk['start_line']}-{chunk['end_line']})\n"
             f"Type: {chunk['type']}\n"
             f"Name: {chunk['name']}\n"
-            f"Code:\n{chunk['content']}\n\n"
+            f"Code:\n{chunk['text']}\n\n"
         )
     return "\n---\n".join(results)
-    
-    
-    

@@ -8,6 +8,12 @@ wheels/
 .env
 # Virtual environments
 .venv
+# Legacy pre-.terminus storage paths, kept so an old checkout is still covered.
 .chromadb/
 .memory/
 .qdrant/
+# Terminus runtime state: LangGraph checkpointer, task database, index
+# manifest, and the local vector stores. All of it is derived from the working
+# tree and is rebuildable, and some of it is large (the checkpointer grows with
+# every conversation), so none of it belongs in version control.
+.terminus/

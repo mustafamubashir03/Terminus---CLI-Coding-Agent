@@ -666,7 +666,7 @@ class _RecordingStore:
     def get_blocked_by_failed(self, _project_id):
         return []
 
-    def _get_all_tasks(self, _project_id):
+    def get_all_tasks(self, _project_id):
         return []
 
 

@@ -1,71 +1,67 @@
-import chromadb
-from pathlib import Path
-from terminus.config import CONFIG
-from terminus.llm.factory import get_embedder
+"""Chroma retrieval.
+
+Isolation here is structural rather than filtered: each project has its own
+persistent directory, so the collection *is* the boundary and no payload filter
+is needed. That is a legitimate alternative to Qdrant's shared collection plus
+a filter, and it is why Chroma's result has no ``project`` key.
+
+The collection is cached per resolved persist directory, which is what stops a
+process that moved between projects from serving the previous project's chunks.
+"""
+
+from __future__ import annotations
+
+from terminus.context.retrievers.retrieved import RetrievedChunk
 from terminus.observability.logging import get_logger
-from terminus.workspace import project_root
 
 logger = get_logger(__name__)
 
-_collection_cache: chromadb.Collection | None = None
-_collection_cache_key: str | None = None
 
+def _collection():
+    import chromadb
 
-def _persist_dir() -> str:
-    """Absolute persist directory for the *current* project.
+    from terminus.context.indexers.semantic_chroma import chroma_persist_path
+    from terminus.context.retrievers.cache import cached_store
 
-    Mirrors context/indexers/semantic_chroma._chroma_persist_path so the
-    indexer and the retriever always address the same store. A relative
-    configured path is resolved against the project root, so two projects in one
-    process get two different collections.
-    """
-    configured = Path(CONFIG["chromadb"]["persist_dir"]).expanduser()
-    if configured.is_absolute():
-        return str(configured)
-    return str(project_root() / configured)
+    from terminus.config import CONFIG
 
-
-def _get_collection() -> chromadb.Collection:
-    """Return the project's ChromaDB collection, opening it once per project.
-
-    The cache is keyed by the resolved persist directory. A single unkeyed
-    module-level handle would be reused after a change of project and would
-    return the *previous* project's chunks, i.e. cross-project data leakage
-    through the semantic index.
-    """
-    global _collection_cache, _collection_cache_key
-    key = _persist_dir()
-    if _collection_cache is None or _collection_cache_key != key:
-        chroma_client = chromadb.PersistentClient(path=key)
-        _collection_cache = chroma_client.get_or_create_collection(
+    return cached_store(
+        f"chroma:{chroma_persist_path()}",
+        lambda: chromadb.PersistentClient(path=str(chroma_persist_path())).get_or_create_collection(
             name=CONFIG["chromadb"]["collection_name"]
-        )
-        _collection_cache_key = key
-        logger.info("ChromaDB collection opened for %s", key)
-    return _collection_cache
-
-def retrieve(query: str, k: int = 5) -> list[dict]:
-    """ Embed the query and finds k most similar chunks"""
-    embedder = get_embedder()
-    query_embedding = embedder.embed_query(query)
-    collection = _get_collection()
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=k,
-        include=["documents", "metadatas"]
+        ),
     )
-    docs = results["documents"][0] if results.get("documents") else []
-    metas = results["metadatas"][0] if results.get("metadatas") else []
-    chunks = []
-    for doc, meta in zip(docs, metas):
-        chunks.append({
-            "content": doc,
-            "source": meta["source"],
-            "name": meta["name"],
-            "type": meta["type"],
-            "start_line": meta["start_line"],
-            "end_line": meta["end_line"],
-        })
-        logger.debug(f"Retrieved {meta['type']} {meta['source']}:{meta['name']}")
-    logger.info(f"Retrieved {len(chunks)} chunks for query: {query}")
+
+
+def retrieve(query: str, k: int = 5) -> list[RetrievedChunk]:
+    """The *k* nearest chunks from this project's collection.
+
+    ``score`` is ``None``: the Chroma query path used here does not return
+    distances, and inventing one from a ranking position would be a number that
+    looks comparable to a Qdrant score and is not.
+    """
+    from terminus.llm.factory import get_embedder
+
+    embedder = get_embedder()
+    results = _collection().query(
+        query_embeddings=[embedder.embed_query(query)],
+        n_results=k,
+        include=["documents", "metadatas"],
+    )
+    documents = (results.get("documents") or [[]])[0]
+    metadatas = (results.get("metadatas") or [[]])[0]
+    chunks = [
+        RetrievedChunk(
+            text=document,
+            source=metadata["source"],
+            name=metadata["name"],
+            type=metadata["type"],
+            start_line=metadata["start_line"],
+            end_line=metadata["end_line"],
+            score=None,
+        )
+        for document, metadata in zip(documents, metadatas, strict=False)
+        if metadata is not None
+    ]
+    logger.info("Retrieved %d chunk(s) for query: %s", len(chunks), query)
     return chunks

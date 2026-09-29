@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +20,24 @@ class FailureInfo:
     provider: str | None = None
     model: str | None = None
     chain: tuple[str, ...] = ()
+    exhausted: bool = False
+    """This route is spent, not merely slow.
+
+    Distinct from ``retryable``. A daily quota or an exhausted credit balance
+    is still a rate limit, so the task-level retry policy keeps treating it as
+    retryable and unchanged. What it must not do is retry the *same provider*:
+    the quota does not come back in a few seconds, so the provider route has to
+    give up on it immediately and move to the next one instead of burning a
+    backoff sleep and another doomed request per call.
+    """
+    reset_in_seconds: float | None = None
+    """How long until the provider says this limit lifts, when it says so.
+
+    Provider-neutral: read from whatever the provider publishes (an epoch
+    instant, a relative Retry-After, a reset counter), never from a hardcoded
+    number for any one vendor. A provider that reports a horizon is skipped
+    until it passes and becomes eligible again afterwards.
+    """
 
 
 class JudgeRejectionError(ValueError):
@@ -156,6 +175,18 @@ def _metadata(exc: BaseException) -> dict[str, Any]:
     }
 
 
+_RETRY_IN_TEXT = re.compile(r"retry\s+(?:in|after)\s+(\d+(?:\.\d+)?)\s*s", re.I)
+
+
+def _retry_after_from_text(exc: BaseException) -> float | None:
+    """A ``retry in 30s`` hint written into the message instead of a header."""
+    for current in _exception_chain(exc):
+        match = _RETRY_IN_TEXT.search(str(current))
+        if match:
+            return float(match.group(1))
+    return None
+
+
 def _retry_after(exc: BaseException) -> float | None:
     for current in _exception_chain(exc):
         response = getattr(current, "response", None)
@@ -167,11 +198,163 @@ def _retry_after(exc: BaseException) -> float | None:
                     return max(0.0, float(value))
                 except (TypeError, ValueError):
                     pass
+    return _retry_after_from_text(exc)
+
+
+QUOTA_HORIZON_SECONDS = 60.0
+"""Beyond this, a rate limit is a quota rather than throttling.
+
+A provider that will not serve you again for minutes or hours is not going to
+serve you again after a five-second backoff. This is the line above which
+retrying the same route is wasted work, and it is a duration, not a status
+code, so it applies to any provider that reports one.
+"""
+
+# Words that mean the limit is over a long window or prepaid credits are gone,
+# as opposed to "slow down".
+_QUOTA_TEXT = re.compile(
+    r"free[-_ ]?models?[-_ ]?per[-_ ]?(?:day|month)"
+    r"|per[-_ ]?day|per[-_ ]?month|daily\s+(?:limit|quota)"
+    r"|monthly\s+(?:limit|quota)"
+    r"|insufficient[_ ]?(?:credits|quota|balance)"
+    r"|exceeded\s+your\s+current\s+(?:credits|quota|budget)"
+    r"|out\s+of\s+credits"
+    r"|add\s+\d+\s*credits",
+    re.I,
+)
+
+
+# Header names providers use to say when a limit lifts. All of these are
+# consulted; none of them is tied to one vendor's naming.
+_RESET_HEADERS = (
+    "retry-after",
+    "x-ratelimit-reset",
+    "x-rate-limit-reset",
+    "ratelimit-reset",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-reset-tokens",
+)
+
+_DURATION_UNITS = {
+    "ms": 0.001,
+    "s": 1.0,
+    "m": 60.0,
+    "h": 3600.0,
+    "d": 86400.0,
+}
+_DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)?", re.I)
+
+
+def _parse_reset_value(raw: Any) -> tuple[str, float] | None:
+    """Interpret a reset header value.
+
+    Providers publish this three different ways, so all three are accepted:
+
+    * an absolute epoch instant, in seconds or milliseconds;
+    * a relative duration, either a bare number of seconds or a Go-style
+      compound duration such as ``6h0m0s`` or ``1m30s``;
+    * a reset counter, which some providers report as a bare epoch value.
+
+    Returns ``("epoch" | "duration", seconds)`` or None.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        number = float(text)
+    except ValueError:
+        pass
+    else:
+        # Above ~1e11 the value is milliseconds, not seconds.
+        if number > 1e11:
+            return "epoch", number / 1000.0
+        # A small bare number is a relative delay; a large one is an instant.
+        if number > 1e9:
+            return "epoch", number
+        return "duration", max(0.0, number)
+    total = 0.0
+    matched = False
+    for value, unit in _DURATION_PART.findall(text):
+        if not value:
+            continue
+        matched = True
+        total += float(value) * _DURATION_UNITS[(unit or "s").lower()]
+    return ("duration", total) if matched else None
+
+
+def _reset_delay_seconds(exc: BaseException) -> float | None:
+    """Seconds until the provider says this limit resets, if it says so at all.
+
+    Prefers the largest horizon any header reports: if one counter says 2s and
+    another says 6h, the binding constraint is the 6h, and treating the limit
+    as short-lived would send us back to a provider that cannot serve us.
+    """
+    now = time.time()
+    best: float | None = None
     for current in _exception_chain(exc):
-        match = re.search(r"retry\s+(?:in|after)\s+(\d+(?:\.\d+)?)\s*s", str(current), re.I)
-        if match:
-            return float(match.group(1))
-    return None
+        response = getattr(current, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers is None:
+            continue
+        for name in _RESET_HEADERS:
+            parsed = _parse_reset_value(headers.get(name))
+            if parsed is None:
+                continue
+            kind, value = parsed
+            delay = (value - now) if kind == "epoch" else value
+            if delay <= 0:
+                continue
+            best = delay if best is None else max(best, delay)
+    if best is not None:
+        return best
+    return _retry_after_from_text(exc)
+
+
+def _body_texts(exc: BaseException) -> list[str]:
+    """Every scrap of body-ish text attached to an exception chain.
+
+    SDKs disagree about where the payload lives - some hang it off the
+    exception, some only on the response object - so all of them are read, and
+    a body that cannot be decoded is simply absent rather than fatal.
+    """
+    texts: list[str] = []
+    for current in _exception_chain(exc):
+        for attribute in ("body", "error"):
+            value = getattr(current, attribute, None)
+            if value is not None:
+                texts.append(_redact(value))
+        response = getattr(current, "response", None)
+        if response is not None:
+            try:
+                texts.append(_redact(getattr(response, "text", "")))
+            except Exception:
+                # An unreadable, streamed or already-closed body carries no
+                # extra signal; the headers and the status have spoken already.
+                pass
+    return texts
+
+
+def _is_quota_exhausted(
+    exc: BaseException, status: int | None, reset_in_seconds: float | None = None
+) -> bool:
+    """True when retrying this same provider cannot possibly help.
+
+    Two independent signals, either of which is sufficient:
+
+    * the provider advertises a reset further out than :data:`QUOTA_HORIZON_SECONDS`;
+    * the body names a long-window limit or exhausted credits.
+    """
+    if reset_in_seconds is not None and reset_in_seconds > QUOTA_HORIZON_SECONDS:
+        return True
+    for text in _body_texts(exc):
+        if text and _QUOTA_TEXT.search(text):
+            return True
+    for current in _exception_chain(exc):
+        if _QUOTA_TEXT.search(str(current)):
+            return True
+    return False
 
 
 def _category(exc: BaseException, status: int | None, message: str) -> str:
@@ -253,6 +436,11 @@ def classify_failure(
             provider=provider or exc.provider,
             model=model or exc.model,
             chain=(type(exc).__name__,) + failure.chain,
+            exhausted=failure.exhausted,
+            # Carried over explicitly. Copying the field list by hand once lost
+            # the reset horizon, which left a re-wrapped quota failure marked
+            # ``exhausted`` with no idea when the route comes back.
+            reset_in_seconds=failure.reset_in_seconds,
         )
     chain = _exception_chain(exc)
     status = _http_status_from(exc)
@@ -267,6 +455,10 @@ def classify_failure(
         "response_parsing",
         "verification_failure",
     }
+    # Only a rate limit can be a spent quota. A 5xx or a timeout says nothing
+    # about how long the provider will stay unavailable, so it keeps retrying.
+    reset_in = _reset_delay_seconds(exc)
+    exhausted = category == "rate_limit" and _is_quota_exhausted(exc, status, reset_in)
     return FailureInfo(
         category=category,
         retryable=retryable,
@@ -276,6 +468,8 @@ def classify_failure(
         provider=provider,
         model=model,
         chain=tuple(type(item).__name__ for item in chain),
+        exhausted=exhausted,
+        reset_in_seconds=reset_in,
         **metadata,
     )
 

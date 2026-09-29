@@ -123,7 +123,7 @@ def test_search_codebase_works_without_write_permission(monkeypatch):
     set_permission_policy(STRICT)
     monkeypatch.setattr(codebase_tool, "get_retriever", lambda: (lambda q, k: [{
         "source": "a.py", "start_line": 1, "end_line": 1,
-        "type": "f", "name": "a", "content": "body",
+        "type": "f", "name": "a", "text": "body",
     }]))
     assert "a.py" in codebase_tool.search_codebase.invoke({"query": "q"})
 
@@ -131,8 +131,8 @@ def test_search_codebase_works_without_write_permission(monkeypatch):
 def test_web_tools_work_without_write_permission():
     """Web tools are read-only and must never be gated behind WRITE."""
     from terminus.tools.web_tools import web_fetch, web_search
-    for tool, args in ((web_search, {"query": "x"}), (web_fetch, {"url": "u"})):
-        for name, schema in tool.args.items():
+    for tool, _args in ((web_search, {"query": "x"}), (web_fetch, {"url": "u"})):
+        for name in tool.args:
             assert name in ("query", "url", "formats", "timeout")
 
 

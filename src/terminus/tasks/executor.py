@@ -20,6 +20,9 @@ from terminus.llm.text import message_text
 from terminus.tools.codebase_tool import search_codebase
 from terminus.tools.terminal_tools import run_command,run_in_directory
 from terminus.skills.skill_tools import load_skill,build_skills_prompt
+from terminus.skills.matcher import detect_conflicts
+from terminus.skills.registry import MAX_SKILLS_PER_TASK, MAX_SKILLS_TOTAL_CHARS
+from terminus.project_context import plan_fields
 from terminus.mcp.terminus_mcp_client import get_terminus_mcp_tools
 from terminus.tools.filesystem_tools import list_directory,read_file,write_file,delete_file,file_exists,append_file
 from terminus.workspace import project_root
@@ -143,7 +146,30 @@ def _as_str_list(value) -> list[str]:
     return []
 
 
-def _build_system_prompt(task: dict, dep_outputs: list[dict]) -> str:
+def _load_plan(project_id: str | None) -> dict | None:
+    """Read this task's plan-level context, or None.
+
+    A worker is told which task it is running, but a task title is meaningless
+    without the project goal it serves. This is the read-only lookup that closes
+    that gap; it never writes, and any failure degrades to "no plan context"
+    rather than blocking execution. A worker only ever runs inside an existing
+    project, so a missing database here is already an error elsewhere.
+    """
+    if not project_id:
+        return None
+    try:
+        from terminus.config import CONFIG
+        from terminus.tasks.task_store import TaskStore
+
+        db_path = CONFIG.get("tasks", {}).get("db_path", ".terminus/tasks/tasks.db")
+        return TaskStore(db_path).get_project(project_id)
+    except Exception:
+        return None
+
+
+def _build_system_prompt(
+    task: dict, dep_outputs: list[dict], plan: dict | None = None
+) -> str:
     prompt = "You are tasked with executing the following subtask:\n"
     prompt += f"Task Type: {task.get('task_type')}\n"
     prompt += f"Description: {task.get('description')}\n"
@@ -155,6 +181,34 @@ def _build_system_prompt(task: dict, dep_outputs: list[dict]) -> str:
     prompt += f"Project ID: {task.get('project_id')}\n"
     prompt += f"Task ID: {task.get('id')}\n"
     prompt += f"Workspace (your working directory, the only tree you may edit): {project_root()}\n"
+
+    # The plan this task belongs to. Without it a worker optimises for its own
+    # description and cannot tell whether it is serving the actual goal.
+    if plan:
+        fields = plan_fields(plan.get("plan_json"))
+        goal = fields.get("goal_summary") or plan.get("goal") or ""
+        if goal:
+            prompt += f"\nProject goal you are working toward: {goal}\n"
+        stack = [str(s) for s in (fields.get("tech_stack") or [])][:5]
+        if stack:
+            prompt += f"Project tech stack: {', '.join(stack)}\n"
+        risks = [str(r) for r in (fields.get("risks") or [])][:5]
+        if risks:
+            prompt += f"Known project risks: {'; '.join(risks)}\n"
+
+    # Acceptance criteria are the contract between this worker and the judge that
+    # grades it. They were persisted and enforced, but never shown to the worker,
+    # so the agent was graded on requirements it could not read. They must be
+    # stated in the same words the judge will use.
+    criteria = _as_str_list(task.get("acceptance_criteria"))
+    if criteria:
+        prompt += "\nYour work must satisfy every one of these acceptance criteria:\n"
+        for criterion in criteria:
+            prompt += f"- {criterion}\n"
+        prompt += (
+            "Make each one true in the files you produce, and state in your final "
+            "summary how each is satisfied.\n"
+        )
 
     output_files = _as_str_list(task.get("output_files"))
     if output_files:
@@ -174,6 +228,80 @@ def _build_system_prompt(task: dict, dep_outputs: list[dict]) -> str:
 
     prompt += "\nEnsure you output exactly what is required to complete this task."
     return prompt
+
+def _worker_skills_section(tools: list) -> str:
+    """The skills catalogue, only where the worker can actually act on it.
+
+    Two things have to hold at once: the catalogue must be non-empty, and this
+    worker's tool set must contain ``load_skill``. Task types "test",
+    "integrate" and "configure" are built without it, so the old unconditional
+    header advertised a tool those workers did not have, and advertised a
+    catalogue that is empty by default anyway.
+    """
+    if not any(getattr(tool, "name", None) == "load_skill" for tool in tools):
+        return ""
+    catalogue = build_skills_prompt()
+    if not catalogue or not catalogue.strip():
+        return ""
+    return f"\n\n======SKILLS======\n\n{catalogue}"
+
+
+def _worker_selected_skills(task: dict) -> str:
+    """Skills chosen for this specific task, injected as instructions.
+
+    The catalogue above only names what exists; this is the bounded decision of
+    which of them apply to *this* task, with the reason recorded, so the worker
+    does not have to spend its budget deciding whether a skill is relevant. The
+    task's own acceptance criteria and deliverables are fed to the matcher as
+    well as its description, because those describe the work better than the
+    title does.
+    """
+    try:
+        from terminus.skills.matcher import match_skills, render_selection
+        from terminus.skills.skill_tools import _get_registry
+
+        registry = _get_registry()
+        # The description and title describe the work. The task_type is excluded
+        # on purpose: it is one of six fixed words, and as query text it matched
+        # skill names - "implement" is in "figma-implement-design", so every
+        # implementation task in any language pulled in the Figma skill.
+        query = " ".join(str(task.get(field) or "") for field in ("description", "title"))
+        criteria = _as_str_list(task.get("acceptance_criteria"))
+        # Only genuine framework facts are passed as signals. The task_type is
+        # deliberately not one of them: "implement" is a substring of
+        # "figma-implement-design", so feeding it in selected the Figma skill for
+        # any implementation task in any language.
+        known_frameworks = ("react", "next.js", "nextjs", "vue", "svelte", "angular", "tailwind")
+        signals = {
+            "frameworks": [c for c in criteria if any(f in c.lower() for f in known_frameworks)],
+        }
+        matches = match_skills(registry, query, limit=MAX_SKILLS_PER_TASK, **signals)
+        block = render_selection(matches, registry)
+        if not block.strip():
+            return ""
+        conflicts = detect_conflicts(matches)
+        if conflicts:
+            # Never concatenate contradictory instructions silently. Say so and
+            # let the project conventions in the prompt win, per precedence.
+            block += (
+                "\n\nNOTE: these skills overlap ("
+                + "; ".join(conflicts)
+                + "). Where they disagree, the project's own conventions and the "
+                "task's acceptance criteria take precedence over any skill."
+            )
+        block = f"\n\n======SELECTED SKILLS======\n{block}"
+        # The budget covers what is actually injected, header and conflict note
+        # included, so the cap is real rather than approximately real.
+        if len(block) > MAX_SKILLS_TOTAL_CHARS:
+            block = (
+                block[: MAX_SKILLS_TOTAL_CHARS - 60].rstrip()
+                + "\n[skills block truncated]"
+            )
+        return block
+    except Exception as exc:
+        # Skills are optional context; never let selection fail a task.
+        logger.debug("Skill selection skipped for task: %s", exc)
+        return ""
 
 class Verdict(BaseModel):
     passed: bool
@@ -264,7 +392,7 @@ async def judge_task(task: dict, output: str, output_file_contents: str = "") ->
     # get_chat_model applies llm.request_timeout_seconds + llm.max_retries so a
     # hung judge request fails fast and transient errors retry (bounded).
     llm = get_chat_model(model, model_provider=provider)
-    
+
     criteria = _as_str_list(task.get("acceptance_criteria"))
     if not criteria:
         raise ValueError(f"Task {task.get('id')} has no acceptance criteria")
@@ -364,10 +492,11 @@ async def _run_worker_agent(
     tool_map = await _tool_plans()
     tools = tool_map.get(task.get("task_type", ""), _DEFAULT_TOOLS)
 
-    system_prompt = _build_system_prompt(task, dep_outputs)
+    system_prompt = _build_system_prompt(task, dep_outputs, _load_plan(task.get("project_id")))
+    system_prompt += _worker_selected_skills(task)
     if feedback:
         system_prompt += f"\n\nPrevious attempt feedback:\n{feedback}"
-    system_prompt = f"{system_prompt}\n\n======SKILLS======\n\n{build_skills_prompt()}"
+    system_prompt += _worker_skills_section(tools)
     logger.info("Building worker agent for task %s: %s", task_id, task.get("description"))
 
     from langchain.agents.middleware import (

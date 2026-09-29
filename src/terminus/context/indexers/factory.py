@@ -1,165 +1,331 @@
+"""Choosing and building the index for the configured vector store.
+
+The decision this module makes is *which backend the user asked for*, and it
+reports that decision rather than changing it.
+
+It used to do the opposite. When the configured Qdrant failed, it rewrote
+``CONFIG["vector_store"]["provider"]`` to ``chromadb``, forced ``rag.mode`` and
+``retrieval_mode`` down to ``semantic``, and returned a Chroma collection. The
+consequences were that a user who configured ``qdrant`` silently got Chroma, that
+hybrid/BM25 retrieval silently disappeared, and that because the substitution
+mutated process-global config, every later call - including ``get_retriever()``
+on each ``search_codebase`` - kept using the substitute. The swap outlived the
+failure that caused it.
+
+So: the configured backend is the backend. If it cannot be used, this raises
+:class:`VectorStoreUnavailableError` with the reason. A fallback exists for
+backwards compatibility, but it is opt-in (``vector_store.fallback_to_chroma``),
+it does not touch ``CONFIG``, and when it engages the caller receives a
+:class:`ResolvedBackend` saying so - because the substitution is a decision
+somebody has to make knowingly.
+"""
+
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlparse
 
 from terminus.config import CONFIG, CONFIG_SOURCE
 from terminus.context.indexers.errors import (
+    IndexerConfigurationError,
+    VectorStoreFailure,
     VectorStoreUnavailableError,
+    classify_failure,
     configuration_error,
-    is_transport_error,
     qdrant_error_message,
 )
 from terminus.observability.logging import get_logger
 
 logger = get_logger(__name__)
 
+QDRANT = "qdrant"
+CHROMA_ALIASES = frozenset({"chromadb", "chroma"})
+
+#: Failures meaning "not usable right now", as opposed to a mistake in the
+#: request. Only these may engage an explicitly enabled fallback: a mistyped
+#: collection or a rejected credential must surface, because answering it by
+#: using a different database would hide the thing the operator needs to fix.
+FALLBACK_PERMITTED = frozenset({
+    VectorStoreFailure.DNS,
+    VectorStoreFailure.CONNECTION_REFUSED,
+    VectorStoreFailure.TLS,
+    VectorStoreFailure.TIMEOUT,
+    VectorStoreFailure.UNAVAILABLE,
+    VectorStoreFailure.LOCAL_STORE,
+})
+
 
 def _config_source() -> str | None:
     return str(CONFIG_SOURCE) if CONFIG_SOURCE else None
 
 
-def _validate_indexer_config(provider: str, mode: str) -> None:
-    if provider not in {"chromadb", "chroma", "qdrant"}:
-        raise configuration_error(f"Unknown indexer provider: {provider}", _config_source())
+def _chroma_alias(provider: str) -> bool:
+    return provider in CHROMA_ALIASES
+
+
+@dataclass(frozen=True)
+class ResolvedBackend:
+    """Which backend is actually in use, and how it differs from configuration.
+
+    ``configured_*`` is what the config says; ``resolved_*`` is what was built.
+    They differ only when an explicit fallback engaged. Carrying the difference
+    here, rather than writing it into ``CONFIG``, is what makes the substitution
+    visible for the life of the process without outliving it.
+
+    ``mode`` is reported honestly. A Chroma fallback from a hybrid configuration
+    resolves to ``semantic``, because Chroma has no BM25 vector here, and
+    reporting hybrid would be a lie the model then reasons from.
+    """
+
+    provider: str
+    mode: str
+    location: str
+    configured_provider: str
+    configured_mode: str
+    fallback: bool = False
+    reason: str = ""
+
+    def describe(self) -> str:
+        line = (
+            f"vector store: provider={self.provider} mode={self.mode} "
+            f"location={self.location}"
+        )
+        if self.fallback:
+            line += (
+                f"\n  FALLBACK ACTIVE: configured provider={self.configured_provider} "
+                f"mode={self.configured_mode} -> resolved provider={self.provider} "
+                f"mode={self.mode}"
+                f"\n  reason: {self.reason}"
+                f"\n  Note: Chroma does not provide the configured hybrid/BM25 "
+                f"retrieval. Results come from dense semantic search only."
+            )
+        return line
+
+    def as_dict(self) -> dict:
+        return {
+            "provider": self.provider,
+            "mode": self.mode,
+            "location": self.location,
+            "configured_provider": self.configured_provider,
+            "configured_mode": self.configured_mode,
+            "fallback": self.fallback,
+            "reason": self.reason,
+        }
+
+
+def configured() -> tuple[str, str]:
+    """``(provider, mode)`` as written in the configuration."""
+    return (
+        str(CONFIG.get("vector_store", {}).get("provider", "")).lower(),
+        str(CONFIG.get("rag", {}).get("mode", "")).lower(),
+    )
+
+
+def location_of(provider: str) -> str:
+    """Where *provider* points, without contacting it."""
+    if _chroma_alias(provider):
+        from terminus.context.indexers.semantic_chroma import chroma_persist_path
+
+        return f"local:{chroma_persist_path(Path.cwd())}"
+    from terminus.context.indexers.qdrant_client import qdrant_location
+
+    return qdrant_location()
+
+
+def resolved_backend(
+    provider: str,
+    mode: str,
+    *,
+    configured_provider: str | None = None,
+    configured_mode: str | None = None,
+    fallback: bool = False,
+    reason: str = "",
+) -> ResolvedBackend:
+    """The descriptor for a resolved provider/mode pair.
+
+    ``configured_*`` defaults to the resolved pair, which is right when nothing
+    was substituted. A fallback passes the original values explicitly, so the
+    descriptor can say "you asked for qdrant/hybrid, you are getting
+    chroma/semantic" rather than quietly reporting the substitute as the choice.
+    """
+    return ResolvedBackend(
+        provider=provider,
+        mode=mode,
+        location=location_of(provider),
+        configured_provider=configured_provider or provider,
+        configured_mode=configured_mode or mode,
+        fallback=fallback,
+        reason=reason,
+    )
+
+
+def validate(provider: str, mode: str) -> None:
+    """Reject a configuration that cannot work, naming the config source.
+
+    Runs before any network or disk access, so a typo is a fast, clear error
+    rather than a confusing failure from inside a storage client.
+    """
+    if not _chroma_alias(provider) and provider != QDRANT:
+        raise configuration_error(
+            f"Unknown vector_store.provider: {provider!r} (expected 'qdrant' or 'chromadb')",
+            _config_source(),
+        )
     if mode not in {"semantic", "hybrid"}:
-        raise configuration_error(f"Unknown RAG mode: {mode}", _config_source())
-    if mode == "hybrid" and provider != "qdrant":
+        raise configuration_error(f"Unknown rag.mode: {mode!r}", _config_source())
+    if mode == "hybrid" and not provider == QDRANT:
         raise configuration_error(
-            "Hybrid mode is only supported for qdrant", _config_source()
+            "rag.mode 'hybrid' is only supported for qdrant; chromadb has no "
+            "sparse/BM25 vector in this project. Use rag.mode: semantic, or "
+            "switch vector_store.provider to qdrant.",
+            _config_source(),
         )
-    if provider != "qdrant":
+    if provider != QDRANT:
         return
-    collection = CONFIG.get("qdrant", {}).get("collection_name")
-    if not collection:
-        raise configuration_error(
-            "Qdrant collection_name is not configured", _config_source()
-        )
+    from terminus.context.indexers.qdrant_client import collection_name, qdrant_mode
+
+    collection_name()
+    if qdrant_mode() != "cloud":
+        return
     endpoint = os.getenv("CLUSTER_ENDPOINT", "")
-    if endpoint:
-        parsed = urlparse(endpoint)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise configuration_error(
-                "CLUSTER_ENDPOINT must be an HTTP(S) URL", _config_source()
-            )
+    if endpoint and urlparse(endpoint).scheme not in {"http", "https"}:
+        raise configuration_error("CLUSTER_ENDPOINT must be an http(s) URL", _config_source())
     if mode == "hybrid":
-        retrieval_mode = CONFIG.get("vector_store", {}).get(
-            "retrieval_mode", "hybrid"
-        )
-        if retrieval_mode not in {"dense", "sparse", "hybrid"}:
+        retrieval = str(CONFIG.get("vector_store", {}).get("retrieval_mode", "hybrid")).lower()
+        if retrieval not in {"dense", "sparse", "hybrid"}:
             raise configuration_error(
-                f"Unsupported Qdrant retrieval mode: {retrieval_mode}",
-                _config_source(),
+                f"Unsupported vector_store.retrieval_mode: {retrieval!r}", _config_source()
             )
 
 
-def _create_indexer(provider: str, mode: str, repo_path: str, force_reindex: bool):
+def build_index(provider: str, mode: str, repo_path: str, force_reindex: bool):
+    """Construct the index for an already-validated provider/mode pair."""
+    if _chroma_alias(provider):
+        from terminus.context.indexers.semantic_chroma import get_or_create_chroma_index
+
+        return get_or_create_chroma_index(repo_path, force_reindex=force_reindex)
     if mode == "semantic":
-        if provider in {"chromadb", "chroma"}:
-            from terminus.context.indexers.semantic_chroma import (
-                get_or_create_chroma_index,
-            )
-
-            return get_or_create_chroma_index(
-                repo_path, force_reindex=force_reindex
-            )
-        from terminus.context.indexers.semantic_qdrant import (
-            get_or_create_qdrant_index,
-        )
+        from terminus.context.indexers.semantic_qdrant import get_or_create_qdrant_index
 
         return get_or_create_qdrant_index(repo_path, force_reindex=force_reindex)
-    from terminus.context.indexers.hybrid_qdrant import (
-        get_or_create_qdrant_hybrid_index,
+    from terminus.context.indexers.hybrid_qdrant import get_or_create_qdrant_hybrid_index
+
+    return get_or_create_qdrant_hybrid_index(repo_path, force_reindex=force_reindex)
+
+
+def fallback_enabled() -> bool:
+    return bool(CONFIG.get("vector_store", {}).get("fallback_to_chroma", False))
+
+
+def get_or_create_index(repo_path: str, force_reindex: bool = False):
+    """``(index, ResolvedBackend)`` for the configured store.
+
+    Raises :class:`VectorStoreUnavailableError` when the configured backend
+    cannot be used and no fallback is permitted. ``CONFIG`` is never modified,
+    here or anywhere below.
+    """
+    provider, mode = configured()
+    validate(provider, mode)
+    resolved = resolved_backend(provider, mode)
+    logger.info("Indexing %s -> %s", repo_path, resolved.describe())
+
+    try:
+        return build_index(provider, mode, str(repo_path), force_reindex), resolved
+    except Exception as exc:
+        if provider != QDRANT or not fallback_enabled():
+            raise _unavailable(exc, repo_path, provider, mode) from exc
+        failure = classify_failure(exc)
+        if failure not in FALLBACK_PERMITTED:
+            raise _unavailable(exc, repo_path, provider, mode) from exc
+        return _fall_back_to_chroma(exc, repo_path, provider, mode)
+
+
+def _fall_back_to_chroma(exc: Exception, repo_path: str, provider: str, mode: str):
+    """Chroma for a reachability failure, with the substitution reported.
+
+    Loud on purpose. The previous version of this path logged a warning and
+    rewrote the global config, so the substitution was invisible to the user and
+    permanent for the process.
+    """
+    reason = qdrant_error_message(
+        exc, repo_path, provider, mode,
+        CONFIG.get("qdrant", {}).get("collection_name"), _config_source(),
+    ).splitlines()[-1].strip()
+    logger.error(
+        "vector_store.fallback_to_chroma is enabled and %s/%s is unreachable (%s). "
+        "Falling back to repository-local Chroma semantic search. This is a "
+        "SUBSTITUTION, not the configured backend, and hybrid/BM25 retrieval is "
+        "not available on this path.", provider, mode, reason,
+    )
+    try:
+        index = build_index("chromadb", "semantic", repo_path, False)
+    except Exception as chroma_exc:
+        raise VectorStoreUnavailableError(
+            f"vector_store.fallback_to_chroma is enabled, but Chroma also failed "
+            f"({type(chroma_exc).__name__}: {chroma_exc}). Neither backend is usable."
+        ) from chroma_exc
+    return index, resolved_backend(
+        "chromadb",
+        "semantic",
+        configured_provider=provider,
+        configured_mode=mode,
+        fallback=True,
+        reason=reason,
     )
 
-    return get_or_create_qdrant_hybrid_index(
-        repo_path, force_reindex=force_reindex
-    )
 
-
-def _fallback_enabled() -> bool:
-    return bool(CONFIG.get("vector_store", {}).get("fallback_to_chroma", True))
-
-
-def _is_qdrant_unavailable(exc: Exception) -> bool:
-    if is_transport_error(exc):
-        return True
-    message = str(exc)
-    return "QDRANT_API_KEY" in message or "CLUSTER_ENDPOINT" in message
-
-
-def _activate_chroma_fallback(
-    repo_path: str, provider: str, mode: str, error: VectorStoreUnavailableError
-):
-    if not _fallback_enabled():
-        raise error
-    collection = CONFIG.get("qdrant", {}).get("collection_name")
-    logger.warning(
-        "%s Falling back to repository-local Chroma semantic indexing.",
+def _unavailable(exc: Exception, repo_path: str, provider: str, mode: str) -> VectorStoreUnavailableError:
+    error = VectorStoreUnavailableError(
         qdrant_error_message(
-            error.__cause__ or error,
-            repo_path,
-            provider,
-            mode,
-            collection,
-            _config_source(),
-        ),
+            exc, repo_path, provider, mode,
+            CONFIG.get("qdrant", {}).get("collection_name"), _config_source(),
+        )
     )
-    CONFIG.setdefault("vector_store", {})["provider"] = "chromadb"
-    CONFIG["vector_store"]["retrieval_mode"] = "semantic"
-    CONFIG.setdefault("rag", {})["mode"] = "semantic"
-    CONFIG.setdefault("_runtime", {})["indexer_fallback"] = {
-        "from_provider": provider,
-        "from_mode": mode,
-        "to_provider": "chromadb",
-        "to_mode": "semantic",
-    }
-    from terminus.context.indexers.semantic_chroma import get_or_create_chroma_index
-
-    return get_or_create_chroma_index(repo_path)
+    error.__cause__ = exc
+    return error
 
 
 def get_or_create_indexer(repo_path: str, force_reindex: bool = False):
-    provider = str(CONFIG.get("vector_store", {}).get("provider", "")).lower()
-    mode = str(CONFIG.get("rag", {}).get("mode", "")).lower()
-    _validate_indexer_config(provider, mode)
-    try:
-        return _create_indexer(provider, mode, str(repo_path), force_reindex)
-    except Exception as exc:
-        if provider != "qdrant":
-            raise
-        error = VectorStoreUnavailableError(
-            qdrant_error_message(
-                exc,
-                str(repo_path),
-                provider,
-                mode,
-                CONFIG.get("qdrant", {}).get("collection_name"),
-                _config_source(),
-            )
-        )
-        error.__cause__ = exc
-        if not _is_qdrant_unavailable(exc):
-            raise error from exc
-        return _activate_chroma_fallback(str(repo_path), provider, mode, error)
+    """The index alone, for callers that do not need to report which backend.
+
+    Retained because the existing signature is what ``cli.initialize`` and the
+    REPL call. Prefer :func:`get_or_create_index` where the resolution matters.
+    """
+    return get_or_create_index(repo_path, force_reindex)[0]
 
 
-def show_index(index):
-    provider = str(CONFIG.get("vector_store", {}).get("provider", "")).lower()
-    mode = str(CONFIG.get("rag", {}).get("mode", "")).lower()
-    _validate_indexer_config(provider, mode)
-    if mode == "semantic":
-        if provider == "qdrant":
-            from terminus.context.indexers.semantic_qdrant import (
-                show_qdrant_semantic_index,
-            )
-
-            return show_qdrant_semantic_index(index)
-        from terminus.context.indexers.semantic_chroma import (
-            show_chroma_semantic_index,
-        )
+def show_index(index) -> None:
+    """Print a summary of *index*, dispatching on the configured backend."""
+    provider, mode = configured()
+    validate(provider, mode)
+    if _chroma_alias(provider):
+        from terminus.context.indexers.semantic_chroma import show_chroma_semantic_index
 
         return show_chroma_semantic_index(index)
+    if mode == "semantic":
+        from terminus.context.indexers.semantic_qdrant import show_qdrant_semantic_index
+
+        return show_qdrant_semantic_index(index)
     from terminus.context.indexers.hybrid_qdrant import show_qdrant_hybrid_index
 
     return show_qdrant_hybrid_index(index)
+
+
+__all__ = [
+    "CHROMA_ALIASES",
+    "FALLBACK_PERMITTED",
+    "IndexerConfigurationError",
+    "QDRANT",
+    "ResolvedBackend",
+    "VectorStoreUnavailableError",
+    "build_index",
+    "configured",
+    "fallback_enabled",
+    "get_or_create_index",
+    "get_or_create_indexer",
+    "location_of",
+    "resolved_backend",
+    "show_index",
+    "validate",
+]

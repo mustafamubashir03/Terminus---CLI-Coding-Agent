@@ -1,8 +1,9 @@
 [project]
 name = "terminus"
 version = "0.1.0"
-description = "Add your description here"
+description = "A terminal coding agent: codebase Q&A, controlled edits, and planned multi-step work"
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.12, <3.13"
 dependencies = [
     "aiosqlite>=0.22.1",
@@ -25,8 +26,9 @@ dependencies = [
     "python-dotenv>=1.2.3",
     "pyyaml>=6.0.3",
     "rich>=15.0.0",
-    "sentence-transformers>=6.0.0",
-    "tree-sitter<0.22.0",
+      "sentence-transformers>=6.0.0",
+      "typer>=0.15.0",
+      "tree-sitter<0.22.0",
     "tree-sitter-languages>=1.10.2",
 ]
 
@@ -39,4 +41,32 @@ dev = [
 ]
 
 [project.scripts]
-terminus = "terminus.cli:run"
+terminus = "terminus.cli_app:main"
+
+[tool.ruff]
+line-length = 100
+exclude = ["landing"]
+
+[tool.ruff.lint]
+# Rules that catch defects rather than style preferences.
+# E4/E7/E9/W/F are ruff's own defaults. The rest were each added in response to
+# a real defect found in review:
+#   B   bugbear - mutable defaults, lost exception causes, blind asserts
+#   RET dead control flow: an elif after a return/continue/break is never taken
+#   PIE unnecessary pass, and lambdas that only call a constructor
+#   C4 comprehensions that can be written directly
+# E501 is deliberately not enabled: the prompt constants in agent/factory.py are
+# prose meant to be read as prose, and reflowing them to a line limit would make
+# them worse.
+select = ["E4", "E7", "E9", "W", "F", "B", "RET", "PIE", "C4"]
+
+[tool.ruff.lint.per-file-ignores]
+# `raise typer.Exit(...)` after handling an error is control flow, not error
+# wrapping: there is no underlying exception to chain, and `from` would invent
+# one. The genuine lost-cause cases elsewhere in the project are fixed.
+"src/terminus/cli_app/*.py" = ["B904"]
+# Tests assert on shapes and introspect fixtures; a blind `pytest.raises(Exception)`
+# is deliberate where the point is "this must not raise a traceback".
+"tests/*" = ["B017"]
+
+[tool.pytest.ini_options]

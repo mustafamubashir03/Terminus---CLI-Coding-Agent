@@ -1,140 +1,129 @@
-from langchain_core.documents import Document
-import os
-from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
+"""Semantic (dense-only) index over the Qdrant store.
 
+One indexer for both local and cloud: the client comes from
+:mod:`terminus.context.indexers.qdrant_client`, which is the only place that
+decides which, and everything after client construction is shared.
+
+An existing non-empty collection is refreshed incrementally rather than
+rebuilt, using the freshness manifest. Legacy points that predate project
+scoping are reported, never silently repaired - see
+:mod:`terminus.context.qdrant_scope` and :mod:`terminus.context.indexers.migrate`
+for why that repair cannot be automatic.
+"""
+
+from __future__ import annotations
+
+from langchain_core.documents import Document
+
+from terminus.context.indexers.code_parser import get_source_files, parse_file
+from terminus.context.indexers.errors import VectorStoreFailure
+from terminus.context.indexers import qdrant_client
+from terminus.context.indexers.qdrant_client import collection_name, qdrant_location
+from terminus.context.indexers.qdrant_store import write_documents
+from terminus.context.qdrant_scope import (
+    chunk_metadata,
+    ensure_project_payload_index,
+    ensure_source_payload_index,
+    unscoped_points_present,
+)
 from terminus.observability.logging import get_logger
-from terminus.config import CONFIG
-from terminus.llm.factory import get_embedder
-from terminus.context.indexers.code_parser import get_source_files,parse_file
 
 logger = get_logger(__name__)
 
-def get_or_create_qdrant_index(repo_path: str, *, force_reindex: bool = False) -> QdrantVectorStore:
-    """Index the codebase for semantic search.
 
-    If the collection already has points, an incremental freshness check is
-    performed and only changed/new files are re-indexed.  Pass
-    *force_reindex=True* to wipe and rebuild everything from scratch.
+def get_or_create_qdrant_index(repo_path: str, *, force_reindex: bool = False):
+    """Index the codebase for dense semantic search.
+
+    ``force_reindex=True`` wipes and rebuilds. That empties the whole collection,
+    which is shared across projects, so it stays an explicit operator decision.
     """
-    collection_name = CONFIG["qdrant"]["collection_name"]
-    api_key = os.getenv("QDRANT_API_KEY")
-    if not api_key:
-        logger.error("QDRANT_API_KEY not found in .env file")
-        raise ValueError("QDRANT_API_KEY not found in .env file")
-    cluster_endpoint = os.getenv("CLUSTER_ENDPOINT")
-    if not cluster_endpoint:
-        logger.error("CLUSTER_ENDPOINT not found in .env file")
-        raise ValueError("CLUSTER_ENDPOINT not found in .env file")
-    embedder = get_embedder()
-    timeout = float(CONFIG.get("qdrant", {}).get("timeout_seconds", 5))
-    client = QdrantClient(
-        url=cluster_endpoint,
-        api_key=api_key,
-        timeout=timeout,
-        check_compatibility=False,
+    name = collection_name()
+    client = qdrant_client.create_qdrant_client()
+    logger.info(
+        "Qdrant dense index: collection=%s location=%s", name, qdrant_location()
     )
-    existing = [c.name for c in client.get_collections().collections]
 
-    if collection_name in existing:
-        info = client.get_collection(collection_name=collection_name)
-        if info.points_count > 0:
-            if force_reindex:
-                from terminus.context.indexers.reindexer import full_reindex
+    existing = {c.name for c in client.get_collections().collections}
+    if name in existing and (client.get_collection(collection_name=name).points_count or 0) > 0:
+        ensure_project_payload_index(client, name)
+        ensure_source_payload_index(client, name)
+        if unscoped_points_present(client, name):
+            _warn_unscoped(name)
+        if force_reindex:
+            from terminus.context.indexers.reindexer import full_reindex
 
-                logger.info("Force reindex requested ΓÇö wiping and rebuilding")
-                return full_reindex(repo_path)[0]
+            logger.info("Force reindex requested - wiping and rebuilding")
+            return full_reindex(repo_path)[0]
+        from terminus.context.indexers.reindexer import incremental_reindex
 
-            from terminus.context.indexers.reindexer import incremental_reindex
+        store, result = incremental_reindex(repo_path)
+        if result.files_added or result.files_modified or result.files_deleted:
+            logger.info("Incremental reindex: %s", result)
+        return store
 
-            vector_store, result = incremental_reindex(repo_path)
-            if result.files_added or result.files_modified or result.files_deleted:
-                logger.info(f"Incremental reindex: {result}")
-            return vector_store
-
-    # Collection missing or empty ΓÇö full initial index
-    logger.info(f"Loading codebase from: {repo_path}")
+    logger.info("Loading codebase from: %s", repo_path)
     files = get_source_files(repo_path)
-    docs = []
+    documents = _documents(files)
+    store = write_documents(client, documents, name)
+    _save_manifest(repo_path)
+    logger.info("Semantic indexing completed. Indexed %d files into %s", len(files), name)
+    return store
 
+
+def _documents(files) -> list[Document]:
+    """Parse *files* into scoped documents, skipping unparseable ones.
+
+    A file that will not parse is a warning, never a failure: one bad file must
+    not cost the user the whole index.
+    """
+    documents: list[Document] = []
     for filepath in files:
         try:
             chunks = parse_file(filepath)
-        except (SyntaxError, ValueError) as e:
-            logger.error(f"Skipping {filepath} due to parsing error: {e}")
+        except (SyntaxError, ValueError) as exc:
+            logger.warning("Skipping %s: %s: %s", filepath, VectorStoreFailure.PARSE.value, exc)
             continue
         for chunk in chunks:
-            docs.append(Document(
-                page_content=chunk.content,
-                metadata={
-                    "source": chunk.source,
-                    "name": chunk.name,
-                    "type": chunk.type,
-                    "start_line": chunk.start_line,
-                    "end_line": chunk.end_line,
-                },
-            ))
-            logger.debug(f"Embedded and stored {chunk.source}:{chunk.start_line}-{chunk.end_line}")
+            documents.append(Document(page_content=chunk.content, metadata=chunk_metadata(chunk)))
+    return documents
 
-    vector_store = QdrantVectorStore.from_documents(
-        documents=docs,
-        embedding=embedder,
-        collection_name=collection_name,
-        url=cluster_endpoint,
-        api_key=api_key,
-        batch_size=50,
-    )
 
-    # Create manifest so next startup does incremental diff
+def _save_manifest(repo_path: str) -> None:
+    """Record the indexed state so the next run can diff instead of re-parsing."""
     from terminus.context.indexers.freshness import Manifest, _now_iso
-
-    # Ensure metadata.source is indexed so future incremental deletions work
-    try:
-        client.create_payload_index(
-            collection_name=collection_name,
-            field_name="metadata.source",
-            field_schema="keyword",
-        )
-    except Exception:
-        pass  # "already exists" is the expected case
 
     manifest = Manifest(repo_path=repo_path, last_full_index=_now_iso())
     manifest.files = Manifest.snapshot_directory(repo_path)
     manifest.save()
 
-    logger.info(
-        f"Semantic indexing completed. Indexed {len(files)} files "
-        f"into {vector_store.collection_name}"
+
+def _warn_unscoped(name: str) -> None:
+    logger.warning(
+        "Collection %r holds points with no project payload (indexed before project "
+        "scoping). Retrieval is filtered by project, so these points are not "
+        "returned and search will look empty. Rebuild the index to restore them; "
+        "note a full reindex empties this shared collection, which may hold other "
+        "projects' points.",
+        name,
     )
-    return vector_store
 
 
-def show_qdrant_semantic_index(vector_store: QdrantVectorStore)->None:
-    """Show the qdrant semantic index stats"""
+def show_qdrant_semantic_index(store) -> None:
+    """Print the first chunks in the dense index."""
     from rich.console import Console
+
+    from terminus.context.qdrant_scope import METADATA_PAYLOAD_KEY
+
     console = Console()
-    client = vector_store.client
-    collection_name = CONFIG["qdrant"]["collection_name"]
-    results = client.scroll(collection_name=collection_name, with_payload=True,with_vectors=True)
-    points = results[0]
-    console.print(f"Total points: {len(points)}")
-    
-    for i,point in enumerate(points):
-        payload = point.payload
-        embedding = point.vector
-        console.print(f"[bold cyan] Chunk {i+1}:[/bold cyan] {payload}")
-        console.print(f"File: {payload['metadata']['source']}")
-        console.print(f"Name: {payload['metadata']['name']}")
-        console.print(f"Lines: {payload['metadata']['start_line']}-{payload['metadata']['end_line']}")
-        console.print(
-            f"\n[bold]Code:[/bold]\n"
-            f"[code]{payload.get('page_content', '')[:300]}[/code]...\n"
-        )
-        console.print(
-            f"[bold green]Embedding [{len(embedding)}]: "
-            f"{', '.join(f'{v:.4f}' for v in embedding[:5])} ..."
-        )
+    client = store.client
+    name = collection_name()
+    points, _ = client.scroll(collection_name=name, with_payload=True, with_vectors=True)
+    console.print("Collection: %s" % name)
+    console.print("Total points: %d" % len(points))
+    for index, point in enumerate(points, 1):
+        metadata = (point.payload or {}).get(METADATA_PAYLOAD_KEY) or {}
+        console.print("[bold cyan]Chunk %d:[/bold cyan] %s" % (index, metadata))
+        console.print("File: %s" % metadata.get("source", "?"))
+        console.print("Name: %s" % metadata.get("name", "?"))
+        console.print("Lines: %s-%s" % (metadata.get("start_line", "?"), metadata.get("end_line", "?")))
         console.print("-" * 50)
-    
-    
-    

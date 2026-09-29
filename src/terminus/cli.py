@@ -1,11 +1,25 @@
-from terminus.tasks.orchestrator import handle_plan_command
+"""The interactive session: a REPL of slash commands.
+
+Reached by a bare ``terminus`` or ``terminus agent``, and kept as the entry point
+for the REPL specifically. The non-interactive command tree lives in
+``terminus.cli_app``; this module is the conversational surface, not the CLI's
+argument handling.
+
+The loop is a prompt, a slash command or a free-form question, and the commands
+are ordinary ``if`` branches because the set is small and closed. Adding a
+command means adding a branch and a line in ``/help``; there is no registry to
+keep in sync.
+
+``terminus_cli_run`` owns process startup and shutdown for the session: it
+initialises the clients, and releases the checkpointer, the MCP client and the
+LLM connections on the way out, each independently so one failure cannot strand
+the rest.
+"""
+
 import asyncio
-from terminus.memory.session import switch_session,get_current_session
-import uuid
 from pathlib import Path
 from rich.console import Console
-from rich.prompt import Prompt
-from terminus.context.indexers.factory import get_or_create_indexer,show_index
+from terminus.context.indexers.factory import get_or_create_index
 from terminus.env import load_project_env
 from terminus.llm.factory import (
     aclose_llm_clients,
@@ -13,15 +27,21 @@ from terminus.llm.factory import (
     get_embedder,
     get_llm,
 )
-from terminus.agent.orchestrator import handle_query
 from terminus.observability.logging import get_logger
 
 console = Console()
 logger = get_logger(__name__)
 
 def show_task_status():
-    """Display the current task progress for the latest approved project."""
+    """Display the current task progress for the latest approved project.
+
+    Results and failures are shown, not just statuses. A persisted result that
+    only ever reaches a judge is invisible to the person who asked for the work;
+    the same bounded rendering the agents get is used here so there is one
+    definition of what a task "did".
+    """
     from terminus.config import CONFIG
+    from terminus.project_context import collect_project_facts
     from terminus.tasks.task_store import TaskStore
     db_path = CONFIG.get("tasks", {}).get("db_path", ".terminus/tasks/tasks.db")
     store = TaskStore(db_path)
@@ -33,11 +53,58 @@ def show_task_status():
     console.print("[bold green]Task Status:[/bold green]")
     for state, count in progress.items():
         console.print(f"{state.capitalize()}: {count}")
-    tasks = store._get_all_tasks(project_id)
+    tasks = store.get_all_tasks(project_id)
     if tasks:
         console.print("[bold cyan]Tasks Overview:[/bold cyan]")
         for t in tasks:
             console.print(f"- {t['id']}: {t['description']} ({t['status']})")
+
+    facts = collect_project_facts(store, project_id, include_skills=False)
+    if not facts.recent:
+        return
+    console.print("[bold cyan]Results:[/bold cyan]")
+    for task in facts.recent:
+        if not (task.result or task.error):
+            continue
+        attempts = f", {task.attempts} attempt(s)" if task.attempts else ""
+        label = "result" if task.result else "error"
+        body = task.result or task.error
+        console.print(f"- {task.id} ({task.status}{attempts}) {label}:")
+        for line in body.splitlines():
+            console.print(f"    {line}")
+
+def show_index_migration(rebuild_shared_collection: bool = False):
+    """Report whether the Qdrant collection is project-scoped, and optionally fix it.
+
+    Read-only by default. The rebuild is destructive to a collection shared
+    across projects, so it only runs on an explicit flag and only after
+    ``migrate_collection`` has checked the collection is not provably another
+    project's.
+    """
+    from terminus.context.indexers.migrate import (
+        describe_plan,
+        inspect_collection,
+        migrate_collection,
+    )
+
+    if not rebuild_shared_collection:
+        report = inspect_collection()
+        console.print("[bold green]Qdrant project-scoping report:[/bold green]")
+        for line in describe_plan(report):
+            console.print(f"  {line}")
+        if report.needs_migration:
+            console.print(
+                "[yellow]Nothing was changed. Re-run with "
+                "--rebuild-shared-collection to rebuild (this empties the shared "
+                "collection).[/yellow]"
+            )
+        return
+
+    report = migrate_collection(rebuild_shared_collection=True)
+    console.print("[bold green]Qdrant migration result:[/bold green]")
+    for line in describe_plan(report):
+        console.print(f"  {line}")
+
 
 def initialize():
     logger.info("Initializing Terminus...")
@@ -48,9 +115,15 @@ def initialize():
     load_project_env(repo_path)
     llm = get_llm()
     embedder = get_embedder()
-    index = get_or_create_indexer(repo_path)
-    logger.info("Terminus initialized successfully")
-    return llm, embedder, index
+    # The resolution is kept so the REPL and the CLI can report which backend
+    # actually answered, including the case where an explicitly enabled fallback
+    # substituted one. The index itself is unchanged.
+    index, resolution = get_or_create_index(repo_path)
+    if resolution.fallback:
+        console.print(f"[bold yellow]{resolution.describe()}[/bold yellow]")
+    else:
+        logger.info("Terminus initialized successfully: %s", resolution.describe())
+    return llm, embedder, index, resolution
 
 
 def format_startup_error(exc: BaseException) -> str:
@@ -84,135 +157,46 @@ async def shutdown_resources():
             logger.warning("Error closing %s: %s", label, exc)
 
 
-async def terminus_cli_run():
-    logger.info("Starting Terminus CLI")
-    console.print("[bold blue]Welcome to Terminus![/bold blue]")
-    console.print("Type [bold red]'/exit'[/bold red] or [bold red]'/quit'[/bold red] to quit")
-    console.print("Type [bold cyan]'/clear'[/bold cyan] to clear the screen")
-    try:
-        try:
-            _llm, _embedder, index = initialize()
-        except Exception as exc:
-            # A startup failure is a user-facing message, not a traceback.
-            logger.error("Startup failed: %s", exc)
+async def _shutdown_report() -> None:
+    """Everything the process must give back on the way out.
+
+    Token usage first, because it is the thing a user wants before they quit.
+    Then project ownership, which belongs to the process rather than to any one
+    command. Then the shared clients.
+
+    Each step is independent: one that fails must not strand the others, so a
+    failure is reported rather than raised.
+    """
+    from terminus.observability.usage_tracker import get_summary
+
+    summary = get_summary()
+    if summary.records:
+        console.print("\n[bold magenta]Token Usage & Prompt-Caching Report[/bold magenta]")
+        console.print(summary.to_table())
+        if summary.total_cached:
             console.print(
-                f"[bold red]Startup failed:[/bold red] {format_startup_error(exc)}"
+                f"[bold green]Prompt cache saved {summary.savings_percent:.1f}% of "
+                f"input tokens "
+                f"({summary.total_cached:,} of {summary.total_input:,} cached)."
             )
-            return False
-        while True:
-            session_id = get_current_session()
-            query = Prompt.ask("[bold green]Query >> [/bold green]")
-            user_input = query.lower()
-            if user_input == "":
-                console.print("[bold red]Please enter a query[/bold red]")
-                continue
-            elif user_input in ["/exit","/quit"]:
-                console.print("[bold blue]Goodbye![/bold blue]")
-                break
-            elif user_input == "/session":
-                console.print(f"[bold green]Current Session:[/bold green] {session_id}")
-            elif user_input == "/new_session":
-                session_id = str(uuid.uuid4())
-                switch_session(session_id)
-                console.print(f"[bold green]New session created:[/bold green] {session_id}")
-            elif user_input.startswith("/switch"):
-                session_id = user_input.removeprefix("/switch ").strip()
-                if not session_id:
-                    console.print("[bold red]Please enter a session ID[/bold red]")
-                    continue
-                switch_session(session_id)
-                console.print(f"[bold green]Switched to session:[/bold green] {session_id}")
-            elif user_input == "/clear":
-                console.clear()
-                continue
-            elif user_input.startswith("/ask"):
-                question = query.removeprefix("/ask ").strip()
-                if not question:
-                    console.print("[bold red]Please enter a question[/bold red]")
-                    continue
-                console.print(f"[bold green]Question:[/bold green] {question}")
-                try:
-                    response = await handle_query(question, session_id)
-                    console.print(f"[bold blue]Response:[/bold blue] {response}")
-                except Exception as e:
-                    logger.error(f"Query failed: {e}")
-                    console.print(f"[bold red]Query failed:[/bold red] {e}")
-            elif user_input.startswith("/show_semantic_index"):
-                console.print("[bold green]Showing semantic index...[/bold green]")
-                show_index(index)
-            elif user_input.startswith("/plan"):
-                goal = query.removeprefix("/plan ").strip()
-                if not goal:
-                    console.print("[bold red]Please enter a goal[/bold red]")
-                    continue
-                console.print(f"[bold green]Goal:[/bold green] {goal}")
-                logger.info(f"User asked for a plan for the goal: {goal}")
-                response = await handle_plan_command(goal)
-                console.print(f"[bold blue]Response:[/bold blue] {response}")
-            elif user_input.startswith("/task_status"):
-                show_task_status()
 
-            elif user_input.startswith("/help"):
-                console.print("[bold green]Help:[/bold green]")
-                console.print("\n[bold green]Commands:[/bold green]")
-                console.print("[yellow] /ask <question> - Ask a question about codebase[/yellow]")
-                console.print("[yellow] /plan <goal> - Create a new plan for the goal[/yellow]")
-                console.print("[yellow] /plan continue - Resume the latest resumable project[/yellow]")
-                console.print("[yellow] /task_status - Show task status[/yellow]")
-                console.print("[yellow] /clear - Clear the screen[/yellow]")
-                console.print("[yellow] /exit - Exit the CLI[/yellow]")
-                console.print("[yellow] /quit - Exit the CLI[/yellow]")
-                console.print("[yellow] /help - Show this help message[/yellow]")
-                console.print("[yellow] /session - Show current session[/yellow]")
-                console.print("[yellow] /new_session - Create a new session[/yellow]")
-                console.print("[yellow] /switch <session_id> - Switch to a session[/yellow]")
-                console.print("[yellow] /show_semantic_index - Show semantic index stats[/yellow]")
-            else:
-                logger.warning("Invalid query", extra={"query": query})
-                console.print("[bold red]Invalid query[/bold red]")
-                console.print("[yellow] Unknown command Try :  /ask 'Question Here' /clear")
-                console.print("Use '/ask <question>' to ask a question about codebase")
-                console.print("[bold yellow]show_semantic_index[/bold yellow] for showing semantic index")
-        
+    from terminus.ownership import current_ownership
+
+    still_held = set(current_ownership().owned())
+    released = set(current_ownership().release_all())
+    if still_held - released:
+        console.print(
+            f"[bold red]Warning:[/bold red] could not release ownership of "
+            f"project(s) {', '.join(sorted(still_held - released))}. They may "
+            f"process exits."
+        )
+    elif released:
+        logger.info("Released project ownership: %s", ", ".join(sorted(released)))
+
+    await shutdown_resources()
 
 
-
-
-    finally:
-        # Process-wide resources are released here, in the one lifecycle the CLI
-        # already has, rather than in each command handler.
-        from terminus.observability.usage_tracker import get_summary
-
-        summary = get_summary()
-        if summary.records:
-            console.print(
-                "\n[bold magenta]Token Usage & Prompt-Caching Report[/bold magenta]"
-            )
-            console.print(summary.to_table())
-            if summary.total_cached:
-                console.print(
-                    f"[bold green]Prompt cache saved {summary.savings_percent:.1f}% of "
-                    f"input tokens "
-                    f"({summary.total_cached:,} of {summary.total_input:,} cached)."
-                )
-
-        # Project ownership belongs to the process, not to one command, so it is
-        # released from the lifecycle. Anything still held is reported rather
-        # than claimed as released.
-        from terminus.ownership import current_ownership
-
-        still_held = set(current_ownership().owned())
-        released = set(current_ownership().release_all())
-        if still_held - released:
-            console.print(
-                f"[bold red]Warning:[/bold red] could not release ownership of "
-                f"project(s) {', '.join(sorted(still_held - released))}. They may "
-                f"process exits."
-            )
-        elif released:
-            logger.info("Released project ownership: %s", ", ".join(sorted(released)))
-
-        await shutdown_resources()
+from terminus.cli_app.repl import terminus_cli_run  # noqa: E402  (avoids an import cycle)
 
 
 def run():

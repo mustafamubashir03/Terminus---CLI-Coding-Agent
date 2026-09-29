@@ -295,7 +295,7 @@ def test_search_codebase_has_its_own_tighter_budget(tmp_path, monkeypatch):
     monkeypatch.setattr(codebase_tool, "get_retriever",
                         lambda: (lambda q, k: [{
                             "source": "a.py", "start_line": 1, "end_line": 1,
-                            "type": "f", "name": "a", "content": "x",
+                            "type": "f", "name": "a", "text": "x",
                         }]))
     loop = [tool_call("search_codebase", {"query": "q"}, f"s{i}") for i in range(20)]
     agent = build(loop + [final("done")], tmp_path, tool_limit=100)

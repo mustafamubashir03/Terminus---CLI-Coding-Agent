@@ -1,3 +1,25 @@
+"""Running one /ask turn: stream the answer, and own the turn's permissions.
+
+The whole conversational path is here. ``handle_query`` builds the agent, installs
+the turn's execution scope, streams the graph, and returns the final text.
+
+Two details worth knowing before changing it.
+
+**It owns terminal output.** The answer is streamed to stdout as the model
+produces it, so callers must not also print the returned string. It prints to the
+stream and returns the same text, because a caller that wants the answer in a
+variable and a user who wants to watch it arrive are both reasonable.
+
+**The stream is consumed twice over.** ``messages`` yields per-token deltas for
+live output; ``values`` yields graph state so the final answer can be located.
+The first is a presentation concern and the second is the source of truth, which
+is why a non-streaming provider still produces an answer - it just arrives all
+at once.
+
+Message history is not assembled here. The checkpointer replays the thread on the
+next call for the same id, which is what carries the conversation between turns.
+"""
+
 import sys
 
 from terminus.agent.factory import ask_permission_policy, build_agent
@@ -48,11 +70,11 @@ async def handle_query(question: str, thread_id: str | None = None,
 
     The agent graph is consumed with two stream modes at once:
 
-    * ``messages`` ΓÇö per-token deltas from the model node.  These are written to
+    * ``messages`` – per-token deltas from the model node.  These are written to
       stdout as they arrive, so the user sees the answer being produced.  Tool
       output and middleware-internal calls (e.g. the summarizer's own model call)
       are filtered out.
-    * ``values``  ΓÇö the full graph state after each superstep, used exactly as
+    * ``values``  – the full graph state after each superstep, used exactly as
       before to locate the last real answer.
 
     ``messages`` is a superset trigger rather than a replacement: a provider that
@@ -69,7 +91,7 @@ async def handle_query(question: str, thread_id: str | None = None,
     stream in an execution scope, so the tools see /ask's authority and nothing
     else. A /plan worker running elsewhere in the process cannot change it.
     """
-    logger.info(f"Handling query: {question}")
+    logger.info("Handling query: %s", question)
     agent = await build_agent()
     context = ask_context(ask_permission_policy(interactive))
     agent_config = {"configurable": {"thread_id": thread_id}}
@@ -122,7 +144,7 @@ async def handle_query(question: str, thread_id: str | None = None,
                         if content:
                             best = content
                             break
-    except Exception as exc:
+    except Exception:
         _flush_turn()
         if best:
             logger.warning(
@@ -131,7 +153,7 @@ async def handle_query(question: str, thread_id: str | None = None,
             )
             record(handler.records, "ask")
             return best
-        raise exc
+        raise
 
     _flush_turn()
     record(handler.records, "ask")

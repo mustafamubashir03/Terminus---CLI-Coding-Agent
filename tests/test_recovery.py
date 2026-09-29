@@ -58,7 +58,7 @@ def test_retry_semantics_are_total_attempts(store: TaskStore):
     store.claim_task(project_id, "task__001")
     assert store.fail_task(project_id, "task__001", "e3") == TaskStatus.FAILED.value
 
-    task = store._get_all_tasks(project_id)[0]
+    task = store.get_all_tasks(project_id)[0]
     assert task["retry_count"] == 3
     assert task["status"] == TaskStatus.FAILED.value
     # Once the retry budget is exhausted the persisted error is explicitly
@@ -80,7 +80,7 @@ def test_exhausted_retryable_label_is_normalized(store: TaskStore):
             "task__001",
             "[retryable] HTTPStatusError: Client error '412 Precondition Failed'",
         )
-    task = store._get_all_tasks(project_id)[0]
+    task = store.get_all_tasks(project_id)[0]
     assert task["status"] == TaskStatus.FAILED.value
     assert task["error"] == "[retry-exhausted] [retryable] HTTPStatusError: Client error '412 Precondition Failed'"
     assert task["error"].count("[retry-exhausted]") == 1
@@ -94,11 +94,11 @@ def test_retry_success_after_failure(store: TaskStore):
 
     store.claim_task(project_id, "task__001")
     store.fail_task(project_id, "task__001", "e1")
-    assert store._get_all_tasks(project_id)[0]["status"] == TaskStatus.PENDING.value
+    assert store.get_all_tasks(project_id)[0]["status"] == TaskStatus.PENDING.value
 
     store.claim_task(project_id, "task__001")
     store.complete_task(project_id, "task__001", "done")
-    task = store._get_all_tasks(project_id)[0]
+    task = store.get_all_tasks(project_id)[0]
     assert task["status"] == TaskStatus.COMPLETED.value
     assert task["result"] == "done"
     assert task["error"] is None
@@ -115,7 +115,7 @@ def test_manual_recovery_resets_permanently_failed(store: TaskStore):  # noqa: D
 
     reset = store.reset_failed_tasks_for_recovery(project_id)
     assert reset == 1
-    task = store._get_all_tasks(project_id)[0]
+    task = store.get_all_tasks(project_id)[0]
     assert task["status"] == TaskStatus.PENDING.value
     assert task["retry_count"] == 0
     assert task["error"] is None
@@ -285,6 +285,6 @@ async def test_agent_stream_timeout_raises_and_marks_task_failed(tmp_path: Path)
     store.claim_task(project_id, "task__001")
     status = store.fail_task(project_id, "task__001", "agent stream timed out")
     assert status in (TaskStatus.PENDING.value, TaskStatus.FAILED.value)
-    task_row = store._get_all_tasks(project_id)[0]
+    task_row = store.get_all_tasks(project_id)[0]
     assert task_row["status"] != TaskStatus.IN_PROGRESS.value
     assert "timed out" in task_row["error"]

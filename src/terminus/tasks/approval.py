@@ -1,3 +1,18 @@
+"""Human approval of a generated plan, before any task runs.
+
+This is the one mandatory stop in the /plan flow. A plan becomes a set of tasks
+that will edit files, and the model that wrote it is the same model that will
+report on it, so the user gets to see the task list and say no before anything is
+created.
+
+Returning ``None`` means rejected. That is a first-class outcome, not an error:
+the caller re-plans with feedback, and if there is no terminal to ask for
+feedback, it stops rather than proceeding unapproved.
+
+Requires a real terminal. ``human_is_present`` gates it, because a blocking
+``input()`` on a pipe or in CI would hang forever rather than decline.
+"""
+
 from terminus.agent.factory import human_is_present
 from terminus.tasks.planner import ExecutionPlan
 from rich.console import Console
@@ -34,10 +49,10 @@ def present_plan_for_approval(plan : ExecutionPlan)->ExecutionPlan | None:
         choice = input("[A] Approve | [M] Modify | [R] Reject: ").strip().upper()
         if choice == "A":
             return plan
-        elif choice == "M":
+        if choice == "M":
             task_id = input("Enter task ID to modify: ").strip()
             task = next((
-                t 
+                t
                 for t in plan.tasks
                 if t.id == task_id
             ),None)
@@ -53,8 +68,8 @@ def present_plan_for_approval(plan : ExecutionPlan)->ExecutionPlan | None:
             return None
         else:
             console.print("[yellow]Invalid choice. Please try again.[/yellow]")
-            
-        
+
+
 def _render_plan(plan : ExecutionPlan):
     """ Render the plan as a Rich table """
     console.print(f"[bold cyan]Plan: {plan.project_name}")
@@ -66,7 +81,7 @@ def _render_plan(plan : ExecutionPlan):
     table.add_column("ID", style="dim", width=10)
     table.add_column("Description")
     table.add_column("Type", justify="right")
-    
+
     for task in plan.tasks:
         table.add_row(
             task.id,

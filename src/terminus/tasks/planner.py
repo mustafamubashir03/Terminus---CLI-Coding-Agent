@@ -6,9 +6,54 @@ from terminus.llm.text import message_text
 from terminus.config import CONFIG
 from terminus.observability.logging import get_logger
 from terminus.observability.usage_tracker import UsageCallbackHandler, record
+from terminus.context.environment import build_startup_context
+from terminus.project_context import project_prompt_section
+from terminus.workspace import project_root
 
 
 logger = get_logger(__name__)
+
+MAX_PLANNER_CONTEXT_CHARS = 4_000
+"""Ceiling on the context block appended to the planner's goal.
+
+The planner is a single-shot call with no tools, so this snapshot is the only
+thing it can know about the machine it is planning for. It has to be bounded: the
+goal is the message that matters, and context that crowds it out makes plans
+worse, not better.
+"""
+
+
+def _planner_context() -> str:
+    """Bounded snapshot of the workspace and any project already here.
+
+    Two cheap, read-only sources, no model calls and no network:
+
+    * the environment/repo snapshot, so plans are grounded in the real tree
+      instead of being invented from the goal text alone;
+    * the project read model, so re-planning an existing project does not lose
+      what it already built or what already failed.
+
+    Every part is optional. A missing snapshot degrades the plan's grounding; it
+    must never stop a plan from being produced.
+    """
+    parts: list[str] = []
+    try:
+        snapshot = build_startup_context(project_root()).strip()
+        if snapshot:
+            parts.append(snapshot)
+    except Exception as exc:
+        logger.debug("Planner startup context unavailable: %s", exc)
+    try:
+        existing = project_prompt_section().strip()
+        if existing:
+            parts.append(existing)
+    except Exception as exc:
+        logger.debug("Planner project context unavailable: %s", exc)
+
+    context = "\n\n".join(parts)
+    if len(context) > MAX_PLANNER_CONTEXT_CHARS:
+        context = context[: MAX_PLANNER_CONTEXT_CHARS - 20].rstrip() + "\n... [truncated]"
+    return context
 
 
 
@@ -31,7 +76,7 @@ class ExecutionPlan(BaseModel):
     tasks: list[PlannedTask]
     risks: list[str]
     assumptions: list[str]
-    
+
 
 SYSTEM_PROMPT="""
 
@@ -47,6 +92,20 @@ Rules:
 - output files must list every file the task will write to disk
 - acceptance_criteria must be concreate and verifiable (3-5 items per task)
 - task_type must be one of : design, implement, test, review, integrate, configure
+
+Sizing the work. Terminus can delegate a self-contained task to a bounded
+subagent (research, review, testing, or implementation inside an explicit write
+scope). Delegation costs a separate agent run, so it pays only when the work is
+genuinely separable:
+
+  delegate  - an investigation before implementation, an independent review of
+              risky work, a verification pass, or a self-contained component
+              built in parallel with other work
+  do not    - a typo, a one-line fix, anything small, or work that needs the whole
+              picture to be understood first
+
+Do not add a task merely to create something to delegate to. A plan made of 12
+small delegated tasks is worse than 4 well-scoped ones executed directly.
 
 Response format: Return a single STRICT JSON object matching this schema exactly. No markdown fences, no prose, no explanation outside the JSON:
 
@@ -139,6 +198,12 @@ def create_plan(goal: str, extra_content: str = "") -> ExecutionPlan:
     user_message = f"Goal: {goal}"
     if extra_content:
         user_message += f"\nExtra Context: {extra_content}"
+    context = _planner_context()
+    if context:
+        user_message += (
+            f"\n\n## Context about this workspace and project\n"
+            f"(snapshot; the filesystem is authoritative)\n\n{context}"
+        )
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},

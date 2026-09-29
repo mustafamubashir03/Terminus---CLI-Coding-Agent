@@ -71,8 +71,10 @@ def test_search_reports_unavailable_index_instead_of_raising(monkeypatch):
 def test_search_never_raises_for_any_transport_error(monkeypatch):
     for exc in (ConnectionError("dns"), TimeoutError("slow"), OSError("win 10054"),
                 ValueError("bad payload")):
-        def boom(*a, **k):
-            raise exc
+        # `_exc=exc` binds the loop variable now; a bare `exc` would be looked up
+        # at call time, which only happens to be the right one here.
+        def boom(*a, _exc=exc, **k):
+            raise _exc
 
         monkeypatch.setattr(codebase_tool, "get_retriever", boom)
         out = invoke(codebase_tool.search_codebase, query="x")
@@ -94,7 +96,7 @@ def test_search_no_results_suggests_grep(monkeypatch):
 def test_search_returns_results_when_index_works(monkeypatch):
     chunks = [{
         "source": "src/a.py", "start_line": 1, "end_line": 2,
-        "type": "function", "name": "a", "content": "def a(): ...",
+        "type": "function", "name": "a", "text": "def a(): ...",
     }]
     monkeypatch.setattr(codebase_tool, "get_retriever",
                         lambda: (lambda q, k: chunks))

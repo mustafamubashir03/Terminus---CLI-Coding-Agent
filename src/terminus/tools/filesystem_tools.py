@@ -305,8 +305,7 @@ def file_exists(file_path:str)->str:
     try:
         if os.path.exists(file_path) and os.path.isfile(file_path):
             return f"File exists: {file_path}"
-        else:
-            return f"File does not exist: {file_path}"
+        return f"File does not exist: {file_path}"
     except Exception as e:
         return f"Error checking file: {str(e)}"
 
@@ -380,4 +379,4 @@ def grep(pattern: str, path: str = ".") -> str:
             f"\n... stopped after {_GREP_MAX_MATCHES} matches "
             "(narrow the pattern or pass a more specific path)"
         )
-    return result
+    return result

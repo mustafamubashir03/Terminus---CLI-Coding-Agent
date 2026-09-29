@@ -70,7 +70,7 @@ def test_fail_task_retries_until_max(store: TaskStore):
     status = store.fail_task(project_id, "task__001", "transient error")
     assert status == TaskStatus.PENDING.value
 
-    tasks = store._get_all_tasks(store.get_latest_project())
+    tasks = store.get_all_tasks(store.get_latest_project())
     task = tasks[0]
     assert task["retry_count"] == 1
     assert task["status"] == TaskStatus.PENDING.value
@@ -81,7 +81,7 @@ def test_fail_task_retries_until_max(store: TaskStore):
     status = store.fail_task(project_id, "task__001", "final")
     assert status == TaskStatus.FAILED.value
 
-    task = store._get_all_tasks(store.get_latest_project())[0]
+    task = store.get_all_tasks(store.get_latest_project())[0]
     assert task["retry_count"] == 3
     assert task["status"] == TaskStatus.FAILED.value
 
@@ -113,7 +113,7 @@ def test_failed_upstream_blocks_dependents(store: TaskStore):
 
     for _ in range(3):
         store.fail_task(project_id, "task__001", "error")
-        if store._get_all_tasks(project_id)[0]["status"] == TaskStatus.PENDING.value:
+        if store.get_all_tasks(project_id)[0]["status"] == TaskStatus.PENDING.value:
             store.claim_task(project_id, "task__001")
 
     blocked = store.get_blocked_by_failed(project_id)
@@ -129,7 +129,7 @@ def test_recover_interrupted_tasks(store: TaskStore):
 
     recovered = store.recover_interrupted_tasks(project_id)
     assert recovered == 1
-    task = store._get_all_tasks(project_id)[0]
+    task = store.get_all_tasks(project_id)[0]
     assert task["status"] == TaskStatus.PENDING.value
 
 

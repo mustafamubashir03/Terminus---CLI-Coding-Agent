@@ -13,6 +13,90 @@ from terminus.tasks.errors import FailureInfo, ProviderCallError, classify_failu
 
 logger = get_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# Provider-level exhaustion
+#
+# A rate limit and a spent account are different things. A throttle clears in
+# seconds, so retrying is right. A daily quota, a monthly cap or an empty credit
+# balance does not clear on a backoff, so retrying the same provider is wasted
+# work repeated on every model call in an agent loop.
+#
+# The registry is keyed by provider and stores an absolute deadline, so it holds
+# no vendor-specific knowledge: a provider that publishes a reset horizon is
+# skipped until that horizon passes, then becomes eligible again on its own. A
+# provider that reports no horizon is still skipped for this process, because we
+# have no evidence it will recover, and the next process re-tests it.
+#
+# Process-scoped on purpose, matching the existing module-level caches here.
+# ---------------------------------------------------------------------------
+
+_UNKNOWN_HORIZON_SECONDS = 900.0
+"""How long to stay away from a provider that says it is spent but not for how long.
+
+Long enough to cover the rest of a working session, short enough that a
+transient mis-report does not disable a provider for the day. The point is not
+this number; it is that the registry prefers a real reported horizon whenever
+the provider gives one.
+"""
+
+_exhausted_providers: dict[str, float] = {}
+
+
+def provider_exhausted_until(provider: str | None) -> float | None:
+    """Absolute epoch second this provider is unusable until, if it is.
+
+    Returns None when the provider is eligible, which is also the answer once a
+    recorded deadline has passed - the entry is dropped on read so it cannot go
+    stale and keep a recovered provider disabled.
+    """
+    if not provider:
+        return None
+    deadline = _exhausted_providers.get(provider.lower())
+    if deadline is None:
+        return None
+    import time
+
+    if deadline <= time.time():
+        _exhausted_providers.pop(provider.lower(), None)
+        return None
+    return deadline
+
+
+def mark_provider_exhausted(
+    provider: str | None, reset_in_seconds: float | None = None
+) -> float | None:
+    """Record that a provider is spent, and until when.
+
+    ``reset_in_seconds`` is whatever the provider reported. When it reported
+    nothing, a bounded default is used so the entry cannot disable the provider
+    indefinitely. Returns the deadline for logging and tests.
+    """
+    if not provider:
+        return None
+    import time
+
+    seconds = (
+        reset_in_seconds
+        if reset_in_seconds is not None and reset_in_seconds > 0
+        else _UNKNOWN_HORIZON_SECONDS
+    )
+    deadline = time.time() + seconds
+    _exhausted_providers[provider.lower()] = deadline
+    return deadline
+
+
+def clear_provider_exhaustion(provider: str | None = None) -> None:
+    """Forget exhaustion state. All providers when *provider* is None."""
+    if provider is None:
+        _exhausted_providers.clear()
+    else:
+        _exhausted_providers.pop(provider.lower(), None)
+
+
+def exhaustion_snapshot() -> dict[str, float]:
+    """Current provider deadlines, for diagnostics and tests."""
+    return dict(_exhausted_providers)
+
 
 class FallbackChatModel(BaseChatModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -116,14 +200,53 @@ class FallbackChatModel(BaseChatModel):
     def _log_primary_failure(self, failure: FailureInfo, attempt: int) -> None:
         logger.warning(
             "Provider route attempt failed: provider=%s model=%s category=%s "
-            "status=%s retryable=%s attempt=%s",
+            "status=%s retryable=%s exhausted=%s attempt=%s",
             self.primary_provider,
             self.primary_model,
             failure.category,
             failure.status_code,
             failure.retryable,
+            failure.exhausted,
             attempt,
         )
+
+    def _skip_exhausted_primary(self) -> bool:
+        """True if this route's primary is known-spent, so it must not be called.
+
+        Only consulted when the primary is a real model client. When it is
+        another FallbackChatModel (the nested multi-route chain), that inner
+        model already performs this check for its own provider, and skipping the
+        whole chain here would also skip the intermediate fallbacks that are
+        still perfectly healthy.
+        """
+        if isinstance(self.primary, FallbackChatModel):
+            return False
+        deadline = provider_exhausted_until(self.primary_provider)
+        if deadline is None:
+            return False
+        import time
+
+        logger.warning(
+            "Skipping exhausted provider: provider=%s model=%s usable_again_in=%.0fs",
+            self.primary_provider,
+            self.primary_model,
+            max(0.0, deadline - time.time()),
+        )
+        return True
+
+    def _note_exhausted(self, failure: FailureInfo) -> None:
+        deadline = mark_provider_exhausted(
+            self.primary_provider, failure.reset_in_seconds
+        )
+        import time
+
+        if deadline is not None:
+            logger.warning(
+                "Provider exhausted: provider=%s model=%s usable_again_in=%.0fs",
+                self.primary_provider,
+                self.primary_model,
+                max(0.0, deadline - time.time()),
+            )
 
     def _generate(
         self,
@@ -135,7 +258,10 @@ class FallbackChatModel(BaseChatModel):
         import time
 
         call_kwargs = self._kwargs(stop, run_manager, kwargs)
+        primary_exhausted = self._skip_exhausted_primary()
         for attempt in range(1, self.primary_attempts + 1):
+            if primary_exhausted:
+                break
             try:
                 return self._result(
                     self.primary.invoke(messages, **call_kwargs),
@@ -145,6 +271,12 @@ class FallbackChatModel(BaseChatModel):
             except Exception as exc:
                 failure = self._should_fallback(exc)
                 self._log_primary_failure(failure, attempt)
+                if failure.exhausted:
+                    # The quota does not return within this call. Retrying it
+                    # would spend a backoff sleep and another doomed request,
+                    # on every model call, to arrive at the same answer.
+                    self._note_exhausted(failure)
+                    break
                 if not failure.retryable:
                     raise
                 if attempt < self.primary_attempts:
@@ -183,7 +315,10 @@ class FallbackChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         call_kwargs = self._kwargs(stop, run_manager, kwargs)
+        primary_exhausted = self._skip_exhausted_primary()
         for attempt in range(1, self.primary_attempts + 1):
+            if primary_exhausted:
+                break
             try:
                 response = await self.primary.ainvoke(messages, **call_kwargs)
                 return self._result(
@@ -194,6 +329,9 @@ class FallbackChatModel(BaseChatModel):
             except Exception as exc:
                 failure = self._should_fallback(exc)
                 self._log_primary_failure(failure, attempt)
+                if failure.exhausted:
+                    self._note_exhausted(failure)
+                    break
                 if not failure.retryable:
                     raise
                 if attempt < self.primary_attempts:

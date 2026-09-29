@@ -1,6 +1,8 @@
 import asyncio
 import json
+from contextlib import contextmanager
 from pathlib import Path
+from collections.abc import Iterator
 from rich.console import Console
 
 from terminus.config import CONFIG
@@ -47,16 +49,43 @@ def holds_project_ownership(project_id: str) -> bool:
     return current_ownership().holds(project_id)
 
 
-class RecoveryManager:
-    """Handle resuming interrupted or failed projects."""
+@contextmanager
+def project_ownership(store: TaskStore, project_id: str) -> Iterator[None]:
+    """Hold sole ownership of *project_id* for the duration of the block.
 
-    def __init__(self, store: TaskStore):
-        self.store = store
+    Yields normally, or raises :class:`OwnershipConflict` before yielding if
+    another live Terminus process already owns the project. Release is guaranteed
+    even if the body raises, so a failure inside the block cannot leave the
+    project permanently unownable.
 
-    def recover(self, project_id: str) -> dict[str, int]:
-        interrupted = self.store.recover_interrupted_tasks(project_id)
-        retried = self.store.reset_failed_tasks_for_recovery(project_id)
-        return {"interrupted": interrupted, "retried": retried}
+    Ownership is ref-counted, so nesting this is safe: the inner exit gives back
+    one level rather than dropping the lock the outer one still needs.
+    """
+    acquire_project_ownership(store, project_id)
+    try:
+        yield
+    finally:
+        release_project_ownership(project_id)
+
+
+def recover_project(store: TaskStore, project_id: str) -> dict[str, int]:
+    """Re-open work that a previous run left in flight, and reset hard failures.
+
+    Two distinct operations, reported separately because the user needs to know
+    which happened: *interrupted* tasks were mid-flight when the process died,
+    and *retried* tasks had exhausted their automatic budget. The second is
+    subject to the project's recovery-cycle cap; see
+    :meth:`TaskStore.reset_failed_tasks_for_recovery`.
+
+    A function rather than a manager object: it holds no state of its own beyond
+    the store it is handed, and the only invariant that matters here - own the
+    project before calling it - is enforced by :func:`project_ownership` at the
+    call site, where it can be seen.
+    """
+    return {
+        "interrupted": store.recover_interrupted_tasks(project_id),
+        "retried": store.reset_failed_tasks_for_recovery(project_id),
+    }
 
 
 MAX_CONCURRENT_TASKS = 4
@@ -165,7 +194,7 @@ class TaskOrchestrator:
             deps = ", ".join(item["blocked_by"])
             console.print(f"  - {task['id']} blocked by: {deps}")
 
-        tasks = self.store._get_all_tasks(project_id)
+        tasks = self.store.get_all_tasks(project_id)
         for task in tasks:
             if task["status"] == TaskStatus.FAILED.value:
                 console.print(
@@ -257,19 +286,77 @@ async def _run_orchestration(store: TaskStore, project_id: str) -> None:
         else:
             console.print("[bold green]Index already up to date[/bold green]")
     except asyncio.TimeoutError:
-        logger.error(f"Re-indexing timed out after {index_timeout}s")
+        logger.error("Re-indexing timed out after %ss", index_timeout)
         console.print("[bold red]Re-indexing timed out (project state is unaffected)[/bold red]")
     except Exception as e:
-        logger.error(f"Failed to re-index: {type(e).__name__}: {e}", exc_info=True)
+        logger.error("Failed to re-index: %s: %s", type(e).__name__, e, exc_info=True)
         console.print("[bold red]Failed to re-index[/bold red]")
 
 
-async def handle_plan_command(goal: str) -> None:
-    """
-    Full /plan flow - entry point called by cli.py.
+MAX_PLAN_ATTEMPTS = 3
+"""How many times plan generation is retried before giving up.
 
-    /plan continue  -> resume the newest resumable project
-    /plan <goal>    -> always create a new project
+A provider failure here is usually transient (a rate limit, a dropped
+connection), so retrying is worth it. Three is enough to ride out a throttle and
+small enough that a systematically unplannable goal fails in a reasonable time.
+"""
+
+
+async def _plan_with_approval(goal: str) -> tuple[object | None, str]:
+    """Plan *goal* and get it approved. Returns ``(plan, feedback)``.
+
+    ``(None, ...)`` means no approved plan. The human-in-the-loop rejection
+    path asks what to change and re-plans with the answer, which is why the
+    feedback string is returned alongside: a caller that wants to report why a
+    plan failed needs it.
+
+    Re-planning needs a person. Without a terminal there is nobody to ask, so a
+    rejected plan stops rather than blocking forever on a pipe or in CI.
+    """
+    feedback = ""
+    provider = CONFIG.get("llm", {}).get("provider")
+    for attempt in range(MAX_PLAN_ATTEMPTS):
+        try:
+            raw_plan = await asyncio.to_thread(create_plan, goal, feedback)
+            validate_plan(raw_plan)
+            approved = present_plan_for_approval(raw_plan)
+            if approved is not None:
+                return approved, feedback
+            if not human_is_present():
+                console.print(
+                    "[bold red]Plan rejected and no interactive terminal is "
+                    "available to ask what to change it. Not creating a project.[/bold red]"
+                )
+                return None, feedback
+            feedback = input("What should be changed or added in the plan? : \n").strip()
+            console.print("\n Re-planning with your feedback\n", style="cyan")
+        except Exception as exc:
+            detail = format_failure(classify_failure(exc, provider=provider), provider=provider)
+            logger.error("Plan generation failed: %s", detail)
+            if attempt < MAX_PLAN_ATTEMPTS - 1:
+                console.print(
+                    f"[yellow]Plan failed, retrying ({attempt + 2}/{MAX_PLAN_ATTEMPTS})...[/yellow]"
+                )
+            else:
+                console.print(f"[bold red]Plan generation failed: {detail}[/bold red]")
+    return None, feedback
+
+
+async def handle_plan_command(goal: str) -> None:
+    """The /plan flow. Two entry shapes, and nothing else:
+
+    ``/plan continue``  resume the newest project that still has recoverable work
+    ``/plan <goal>``    always plan something new
+
+    Both branches end the same way - take ownership, run, release - and that is
+    the point of the ``project_ownership`` scope. Recovery resets tasks that were
+    in flight when a previous process died, which is only safe if no live process
+    is working on them, so ownership is taken *before* any state is read for
+    mutation rather than after.
+
+    Neither branch raises on a lost race: a conflict is reported and the command
+    returns, because "another Terminus is already doing this" is an ordinary
+    situation the user can act on, not a crash.
     """
     db_path = CONFIG.get("tasks", {}).get("db_path", ".terminus/tasks/tasks.db")
     store = TaskStore(db_path)
@@ -306,80 +393,15 @@ async def handle_plan_command(goal: str) -> None:
         # other way round would let this process reset a live orchestrator's
         # running task before discovering it was not alone.
         try:
-            acquire_project_ownership(store, project_id)
+            with project_ownership(store, project_id):
+                _resume_existing(store, project_id)
+                await _run_orchestration(store, project_id)
         except OwnershipConflict as conflict:
             console.print(f"[bold red]{conflict}[/bold red]")
-            return
-
-        try:
-            recovery = RecoveryManager(store)
-            stats = recovery.recover(project_id)
-            if stats["interrupted"]:
-                console.print(
-                    f"[yellow]Recovered {stats['interrupted']} "
-                    f"interrupted task(s)[/yellow]"
-                )
-            if stats["retried"]:
-                console.print(
-                    f"[yellow]Reset {stats['retried']} permanently failed task(s) "
-                    f"for manual recovery (recovery cycle "
-                    f"{store.get_recovery_cycles(project_id)}/"
-                    f"{MAX_RECOVERY_CYCLES})[/yellow]"
-                )
-            elif store.get_recovery_cycles(project_id) >= MAX_RECOVERY_CYCLES:
-                # The cap is the reason nothing was reset; say so rather than
-                # leaving the user to wonder why their failed task did not run.
-                console.print(
-                    f"[bold red]This project has already used all "
-                    f"{MAX_RECOVERY_CYCLES} recovery cycles, so its failed tasks "
-                    f"will not be retried again. Fix the underlying problem, or "
-                    f"start a new plan.[/bold red]"
-                )
-            if stats["interrupted"] == 0 and stats["retried"] == 0:
-                console.print(
-                    "[yellow]No interrupted or failed tasks to recover.[/yellow]"
-                )
-
-            await _run_orchestration(store, project_id)
-        finally:
-            # Released even if orchestration raises, so a failure here cannot
-            # leave the project permanently unownable.
-            release_project_ownership(project_id)
         return
 
     console.print("[bold yellow]Planning new project...[/bold yellow]")
-    extra_content = ""
-    approved_plan = None
-    max_plan_attempts = 3
-    for plan_attempt in range(max_plan_attempts):
-        try:
-            raw_plan = await asyncio.to_thread(create_plan, goal, extra_content)
-            validate_plan(raw_plan)
-            approved_plan = present_plan_for_approval(raw_plan)
-            if approved_plan is None:
-                # Rejected. Asking what to change needs a human; without a
-                # terminal there is nobody to ask, so stop rather than block
-                # forever on a pipe or in CI.
-                if not human_is_present():
-                    console.print(
-                        "[bold red]Plan rejected and no interactive terminal is "
-                        "available to ask what to change it. Not creating a "
-                        "project.[/bold red]"
-                    )
-                    return
-                extra_content = input("What should be changed or added in the plan? : \n").strip()
-                console.print("\n Re-planning with your feedback\n", style="cyan")
-                continue
-            break
-        except Exception as e:
-            failure = classify_failure(e, provider=CONFIG.get("llm", {}).get("provider"))
-            detail = format_failure(failure, provider=CONFIG.get("llm", {}).get("provider"))
-            logger.error("Plan generation failed: %s", detail)
-            if plan_attempt < max_plan_attempts - 1:
-                console.print(f"[yellow]Plan failed, retrying ({plan_attempt + 2}/{max_plan_attempts})...[/yellow]")
-            else:
-                console.print(f"[bold red]Plan generation failed: {detail}[/bold red]")
-
+    approved_plan, extra_content = await _plan_with_approval(goal)
     if approved_plan is None:
         console.print("[red]No approved plan; not creating a project.[/red]")
         return
@@ -392,14 +414,35 @@ async def handle_plan_command(goal: str) -> None:
     # only from the next `/plan continue`. A conflict is still honoured: it would
     # mean someone else is already orchestrating this project id.
     try:
-        acquire_project_ownership(store, project_id)
+        with project_ownership(store, project_id):
+            await _run_orchestration(store, project_id)
     except OwnershipConflict as conflict:
         console.print(f"[bold red]{conflict}[/bold red]")
-        return
-    try:
-        await _run_orchestration(store, project_id)
-    finally:
-        release_project_ownership(project_id)
+
+
+def _resume_existing(store: TaskStore, project_id: str) -> None:
+    """Report and re-open whatever a previous run left behind."""
+    stats = recover_project(store, project_id)
+    if stats["interrupted"]:
+        console.print(
+            f"[yellow]Recovered {stats['interrupted']} interrupted task(s)[/yellow]"
+        )
+    if stats["retried"]:
+        console.print(
+            f"[yellow]Reset {stats['retried']} permanently failed task(s) "
+            f"for manual recovery (recovery cycle "
+            f"{store.get_recovery_cycles(project_id)}/{MAX_RECOVERY_CYCLES})[/yellow]"
+        )
+    elif store.get_recovery_cycles(project_id) >= MAX_RECOVERY_CYCLES:
+        # The cap is the reason nothing was reset; say so rather than leaving
+        # the user to wonder why their failed task did not run.
+        console.print(
+            f"[bold red]This project has already used all {MAX_RECOVERY_CYCLES} "
+            f"recovery cycles, so its failed tasks will not be retried again. "
+            f"Fix the underlying problem, or start a new plan.[/bold red]"
+        )
+    if not stats["interrupted"] and not stats["retried"]:
+        console.print("[yellow]No interrupted or failed tasks to recover.[/yellow]")
 
 
 def _print_final_summary(progress: dict[str, int]) -> None:

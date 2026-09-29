@@ -1,3 +1,20 @@
+"""Which conversation the CLI is currently in.
+
+The current session is a single UUID in a small file next to the checkpoint
+database, not a row in a table and not an argument threaded through every call.
+The reason is that LangGraph's checkpointer keys threads by id, and something has
+to remember which id this terminal is talking to between invocations - including
+across a restart, which is what makes a conversation resumable.
+
+It is deliberately *only* the current session. Terminus has no catalogue of past
+sessions, and ``terminus sessions list`` reports that plainly rather than
+implying a history it does not keep.
+
+The state file lives under the memory database path, so it inherits the same
+project isolation: two projects in two directories cannot see each other's
+current session.
+"""
+
 import uuid
 from pathlib import Path
 

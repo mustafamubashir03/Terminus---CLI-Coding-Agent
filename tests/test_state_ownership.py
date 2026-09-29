@@ -406,7 +406,7 @@ def test_plan_continue_refuses_the_wrong_workspace(tmp_path, monkeypatch, capsys
     assert "Run Terminus from" in " ".join(out.split())
 
     # nothing may have executed
-    tasks = _store()._get_all_tasks(pid)
+    tasks = _store().get_all_tasks(pid)
     assert all(t["status"] == "pending" for t in tasks), "a task ran in the wrong tree"
 
 
@@ -459,13 +459,24 @@ def test_terminus_md_is_read_per_workspace(tmp_path, monkeypatch):
 
 
 def test_semantic_collection_cache_is_scoped_per_workspace(tmp_path, monkeypatch):
-    """Regression: an unkeyed module-global collection leaked across projects."""
-    from terminus.context.retrievers import semantic_chroma as R
+    """Regression: an unkeyed cached collection leaked across projects.
+
+    The cache now lives in ``retrievers.cache`` and is keyed on the project root,
+    so two projects in one process get two collections. The assertion is
+    unchanged: switching project must open a *new* store, not reuse the last one.
+    """
+    import chromadb
+
+    from terminus.config import CONFIG
+    from terminus.context.indexers.semantic_chroma import chroma_persist_path
+    from terminus.context.retrievers import cache as retrieval_cache
+    from terminus.context.retrievers.cache import cached_store
 
     a, b = tmp_path / "A", tmp_path / "B"
     a.mkdir()
     b.mkdir()
     opened = []
+    retrieval_cache.reset()
 
     class FakeCollection:
         name = "terminus"
@@ -477,23 +488,31 @@ def test_semantic_collection_cache_is_scoped_per_workspace(tmp_path, monkeypatch
         def get_or_create_collection(self, name):
             return FakeCollection()
 
-    monkeypatch.setattr(R.chromadb, "PersistentClient", FakeClient)
-    monkeypatch.setattr(R, "_collection_cache", None)
-    monkeypatch.setattr(R, "_collection_cache_key", None)
+    monkeypatch.setattr(chromadb, "PersistentClient", FakeClient)
+    monkeypatch.setitem(CONFIG["chromadb"], "persist_dir", ".terminus/chromadb/")
+
+    def get():
+        return cached_store(
+            f"chroma:{chroma_persist_path()}",
+            lambda: chromadb.PersistentClient(
+                path=str(chroma_persist_path())
+            ).get_or_create_collection(name=CONFIG["chromadb"]["collection_name"]),
+        )
 
     monkeypatch.chdir(a)
-    R._get_collection()
+    get()
     assert opened[-1].startswith(str(a.resolve()))
 
     monkeypatch.chdir(b)
-    R._get_collection()
+    get()
     assert len(opened) == 2, "the cache was reused across projects"
     assert opened[-1].startswith(str(b.resolve()))
 
     # and it is still cached within one project
     monkeypatch.chdir(a)
-    R._get_collection()
-    assert len(opened) == 3
+    get()
+    assert len(opened) == 2, "the cache was dropped within a single project"
+    retrieval_cache.reset()
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +524,7 @@ def test_worker_prompt_states_its_project_workspace_and_task(in_tmp_cwd):
 
     store = _store()
     pid = store.create_project("goal", _make_plan())
-    task = store._get_all_tasks(pid)[0]
+    task = store.get_all_tasks(pid)[0]
     prompt = _build_system_prompt(task, [])
     assert pid in prompt
     assert task["id"] in prompt
@@ -518,7 +537,7 @@ def test_worker_prompt_carries_no_ask_conversation(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     store = _store()
     pid = store.create_project("goal", _make_plan())
-    task = store._get_all_tasks(pid)[0]
+    task = store.get_all_tasks(pid)[0]
     prompt = _build_system_prompt(task, [{"id": "dep", "result": "DEP-RESULT"}])
     assert "DEP-RESULT" in prompt, "dependency results must cross the boundary"
     assert "conversation" not in prompt.lower()
