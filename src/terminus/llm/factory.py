@@ -6,20 +6,34 @@ import os
 from pathlib import Path
 from typing import Any
 
-from langchain_cohere import ChatCohere
-from langchain_openai import ChatOpenAI
-
 from terminus.cache import cache_llm_client, get_cached_llm_client, llm_cache_key
 from terminus.config import CONFIG, CONFIG_SOURCE, CONFIG_SOURCE_KIND
 from terminus.env import load_project_env
 from terminus.llm import providers
-from terminus.llm.fallback import FallbackChatModel
 from terminus.observability.logging import get_logger
+
+# ``terminus.llm.fallback`` is imported inside ``_with_fallback`` rather than
+# here. It pulls in langchain_core, which costs seconds, and nothing in this
+# module needs it until a client is actually built - so importing it eagerly
+# charged every process, including the ones that only read configuration to
+# report diagnostics.
 
 logger = get_logger(__name__)
 
 
 def _install_threaded_aiohttp_resolver() -> None:
+    """Use aiohttp's threaded DNS resolver on platforms where the default blocks.
+
+    Windows' default resolver blocks the event loop on every DNS lookup, which
+    stalls a concurrent agent turn behind a name lookup. The patch swaps in
+    ``ThreadedResolver`` for any connector built after it runs.
+
+    It is applied inside the builder rather than at import time: importing
+    ``aiohttp`` costs a measurable fraction of a second, and only the Google
+    client uses it. Patching ``TCPConnector.__init__`` affects connectors
+    *created later*, so applying it just before the client is built is both
+    sufficient and far cheaper.
+    """
     import aiohttp
     from aiohttp.resolver import ThreadedResolver
 
@@ -36,58 +50,10 @@ def _install_threaded_aiohttp_resolver() -> None:
     aiohttp.TCPConnector._terminus_threaded_resolver = True
 
 
-_install_threaded_aiohttp_resolver()
-
 _embedder_cache: dict = {}
 _current_model_label = ""
 _current_provider_label = ""
 _active_llm_clients: list[Any] = []
-
-
-class _OpenRouterChatModel(ChatOpenAI):
-    @staticmethod
-    def _reasoning_details(response: Any, index: int) -> Any:
-        if isinstance(response, dict):
-            choices = response.get("choices") or []
-        else:
-            choices = getattr(response, "choices", None) or []
-        if index >= len(choices):
-            return None
-        choice = choices[index]
-        message = choice.get("message") if isinstance(choice, dict) else getattr(choice, "message", None)
-        if isinstance(message, dict):
-            return message.get("reasoning_details")
-        return getattr(message, "reasoning_details", None)
-
-    def _create_chat_result(self, response: Any, generation_info: dict | None = None):
-        result = super()._create_chat_result(response, generation_info)
-        for index, generation in enumerate(result.generations):
-            details = self._reasoning_details(response, index)
-            if details is None:
-                continue
-            metadata = dict(getattr(generation.message, "response_metadata", None) or {})
-            metadata["reasoning_details"] = details
-            generation.message.response_metadata = metadata
-            additional = dict(getattr(generation.message, "additional_kwargs", None) or {})
-            additional["reasoning_details"] = details
-            generation.message.additional_kwargs = additional
-        return result
-
-    def _get_request_payload(self, input_: Any, *, stop: list[str] | None = None, **kwargs: Any) -> dict:
-        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
-        messages = self._convert_input(input_).to_messages()
-        wire_messages = payload.get("messages") or []
-        for index, message in enumerate(messages):
-            if index >= len(wire_messages) or getattr(message, "type", "") != "ai":
-                continue
-            details = (getattr(message, "response_metadata", None) or {}).get(
-                "reasoning_details"
-            ) or (getattr(message, "additional_kwargs", None) or {}).get(
-                "reasoning_details"
-            )
-            if details is not None:
-                wire_messages[index]["reasoning_details"] = details
-        return payload
 
 
 def _load_dotenv() -> None:
@@ -207,7 +173,7 @@ GROQ_REASONING_EFFORTS: dict[str, frozenset[str]] = {
     ),
 }
 
-GROQ_BASE_URL = providers.get("groq").base_url
+GROQ_BASE_URL = providers.get("groq").resolved_base_url()
 """Groq's documented OpenAI-compatible base URL.
 
 Read from the provider table, so the URL a client is built against and the URL
@@ -253,7 +219,9 @@ def _require_key(provider: str, spec: providers.Provider) -> str:
     """The first of *provider*'s credential variables that is set.
 
     Raises naming every accepted variable, because "the key is missing" is only
-    actionable if the user is told which key to set.
+    actionable if the user is told which key to set. A provider that does not
+    require one still uses a key when it is set - a local server ignores it, and
+    sending what the user configured keeps their setup working unchanged.
     """
     import os
 
@@ -261,6 +229,8 @@ def _require_key(provider: str, spec: providers.Provider) -> str:
         value = os.environ.get(name)
         if value:
             return value
+    if not spec.key_required:
+        return "not-needed"
     accepted = " or ".join(spec.env_keys) if spec.env_keys else spec.name
     raise ValueError(f"{accepted} is not set")
 
@@ -268,10 +238,15 @@ def _require_key(provider: str, spec: providers.Provider) -> str:
 def _build_openai_compatible(model: str, spec: providers.Provider, cfg: dict[str, Any]):
     """A ChatOpenAI pointed at an OpenAI-compatible endpoint.
 
-    Covers OpenRouter and Groq, which both document the OpenAI wire format. The
-    provider-specific part is only the body fields each one wants, so the client
-    construction is shared rather than copy-pasted per vendor.
+    One construction path for every provider that speaks OpenAI Chat Completions:
+    the vendor-specific part is only the body fields each one wants.
+
+    The ``langchain_openai`` import is deferred into this function on purpose:
+    it costs seconds, and a Cohere or Google deployment should not pay for an SDK
+    it never constructs.
     """
+    from langchain_openai import ChatOpenAI
+
     api_key = _require_key(spec.name, spec)
     extra_body: dict[str, Any] = {}
     if spec.name == "openrouter":
@@ -279,22 +254,25 @@ def _build_openai_compatible(model: str, spec: providers.Provider, cfg: dict[str
             extra_body["reasoning"] = cfg["reasoning"]
         if cfg.get("include_reasoning", True):
             extra_body["include_reasoning"] = True
-    else:  # groq
+    elif spec.name == "groq":
         effort = _groq_reasoning_effort(cfg, model)
         if effort:
             extra_body["reasoning_effort"] = effort
 
-    cls = _OpenRouterChatModel if spec.name == "openrouter" else ChatOpenAI
+    if spec.name == "openrouter":
+        from terminus.llm._openrouter_model import OpenRouterChatModel
+
+        cls = OpenRouterChatModel
+    else:
+        cls = ChatOpenAI
     return cls(
         model=model,
         api_key=api_key,
-        base_url=spec.base_url,
+        base_url=spec.resolved_base_url() or None,
         timeout=cfg["timeout"],
         max_retries=cfg["max_retries"],
         temperature=0,
         streaming=cfg.get("streaming", False),
-        # Chat Completions throughout. Groq documents its Responses API as beta,
-        # and OpenRouter's reasoning_details handling is built on this format.
         use_responses_api=False,
         extra_body=extra_body or None,
     )
@@ -304,6 +282,11 @@ def _build_google(model: str, spec: providers.Provider, cfg: dict[str, Any]):
     from google import genai
     from google.genai import types
     from langchain_google_genai import ChatGoogleGenerativeAI
+
+    # Applied before the client is built, because patching TCPConnector.__init__
+    # only affects connectors created afterwards. This is the only route that
+    # pulls in aiohttp, so it is also the only place the patch is needed.
+    _install_threaded_aiohttp_resolver()
 
     api_key = _require_key(spec.name, spec)
     google_client = genai.Client(
@@ -322,21 +305,10 @@ def _build_google(model: str, spec: providers.Provider, cfg: dict[str, Any]):
     )
 
 
-class _CohereChatModel(ChatCohere):
-    """Cohere, with its tool-choice vocabulary mapped onto OpenAI's.
-
-    Cohere rejects ``"any"``/``"auto"`` and wants ``"REQUIRED"``. Without this the
-    agent's tool loop fails at the first call on a Cohere route.
-    """
-
-    def bind_tools(self, tools, **kwargs):
-        if kwargs.get("tool_choice") in ("any", "auto"):
-            kwargs["tool_choice"] = "REQUIRED"
-        return super().bind_tools(tools, **kwargs)
-
-
 def _build_cohere(model: str, spec: providers.Provider, cfg: dict[str, Any]):
-    return _CohereChatModel(
+    from terminus.llm._cohere_model import CohereChatModel
+
+    return CohereChatModel(
         model=model,
         api_key=_require_key(spec.name, spec),
         timeout_seconds=cfg["timeout"],
@@ -374,6 +346,7 @@ def _build_langchain(model: str, spec: providers.Provider, cfg: dict[str, Any]):
 _BUILDERS = {
     "openrouter": _build_openai_compatible,
     "groq": _build_openai_compatible,
+    "ollama": _build_openai_compatible,
     "google_genai": _build_google,
     "google": _build_google,
     "cohere": _build_cohere,
@@ -433,6 +406,8 @@ def _with_fallback(
     model: str,
     cfg: dict[str, Any],
 ) -> Any:
+    from terminus.llm.fallback import FallbackChatModel
+
     routed = primary
     for fallback_provider, fallback_model in _fallback_specs():
         if fallback_provider == provider and fallback_model == model:
@@ -472,6 +447,12 @@ def get_llm():
 
 
 def get_chat_model(model: str, model_provider: str | None = None):
+    """The client for *model*, routing through the fallback chain when there is one.
+
+    A provider Terminus declares in its own table is built directly. Anything else
+    goes through LangChain's factory, which is how Anthropic, OpenAI and the rest
+    are supported without Terminus knowing their SDKs.
+    """
     from langchain.chat_models import init_chat_model
 
     cfg = get_llm_config()
@@ -483,7 +464,7 @@ def get_chat_model(model: str, model_provider: str | None = None):
         return cached
 
     _set_current_labels(model, provider)
-    if provider.lower() in {"cohere", "openrouter", "google_genai", "google", "groq"}:
+    if provider.lower() in providers.BUILT_LOCALLY:
         client = _build_model_direct(model, provider, cfg)
     else:
         try:
@@ -494,8 +475,12 @@ def get_chat_model(model: str, model_provider: str | None = None):
                 max_retries=cfg["max_retries"],
             )
         except (ValueError, ImportError) as exc:
-            if "Unsupported provider" not in str(exc) and "requires the" not in str(exc):
+            if _BUILDERS.get(provider.lower()) is None:
                 raise
+            logger.info(
+                "init_chat_model could not build %s (%s); building it directly",
+                provider, exc,
+            )
             client = _build_model_direct(model, provider, cfg)
     _track(client)
     routed = _with_fallback(client, provider, model, cfg)
@@ -543,7 +528,7 @@ def get_provider_diagnostics(role: str = "executor") -> dict[str, Any]:
             "status": _status(name),
         }
         if name.lower() == "groq":
-            entry["base_url"] = spec.base_url
+            entry["base_url"] = spec.resolved_base_url()
             entry["available_models"] = sorted(GROQ_REASONING_EFFORTS)
         return entry
 

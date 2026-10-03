@@ -26,7 +26,7 @@ skills_app = typer.Typer(help="Inspect available skills and agent roles.", no_ar
 db_app = typer.Typer(help="Locate Terminus data files.", no_args_is_help=False)
 index_app = typer.Typer(help="Inspect the semantic index and its migration state.", no_args_is_help=False)
 agent_app = typer.Typer(
-    help="Run the agent: interactively, or once with -p.",
+    help="Run the agent: interactively, or once with a prompt (-p).",
     invoke_without_command=True,
     no_args_is_help=False,
 )
@@ -69,9 +69,6 @@ def model_override(model: str | None, provider: str | None = None) -> Iterator[N
         llm.update(saved)
 
 
-# --- config ----------------------------------------------------------------
-
-
 @config_app.callback(invoke_without_command=True)
 def config_root(ctx: typer.Context,
     json_output: bool = typer.Option(False, "--json", help="Emit JSON."),
@@ -102,6 +99,202 @@ def config_list(as_json: bool = typer.Option(False, "--json", help="Emit JSON.")
     formatting.emit(payload, as_json=as_json, render=render)
 
 
+@config_app.command("show")
+def config_show(
+    as_json: bool = typer.Option(False, "--json", help="Emit JSON."),
+) -> None:
+    """Answer: what will Terminus actually use, and is it configured?
+
+    The one command to run when the question is "why did it do that?". It
+    resolves the route the same way the agent will, and reports each
+    credential's presence and origin - never its value.
+    """
+    import terminus.config as config_module
+    from terminus.llm.factory import get_provider_diagnostics
+
+    # Re-resolve from disk rather than trusting the copy built at import. This
+    # command exists to answer "what will Terminus use right now", and answering
+    # from a snapshot taken whenever the module happened to be imported is only
+    # accidentally correct: it is wrong in any process that wrote or removed a
+    # config file after starting, which is exactly what `config set` does.
+    CONFIG = config_module.load_config()
+    # Same resolution startup applies, so this command and the agent can
+    # never disagree about which provider is in use.
+    try:
+        from terminus.user_config import apply_auto_provider
+
+        apply_auto_provider()
+    except Exception:
+        pass
+    CONFIG_SOURCE = config_module.CONFIG_SOURCE
+    CONFIG_SOURCE_KIND = config_module.CONFIG_SOURCE_KIND
+    CONFIG_SOURCE_LAYERS = config_module.CONFIG_SOURCE_LAYERS
+    from terminus.user_config import (
+        configured_provider_has_credential,
+        credential_status,
+        has_usable_llm_credential,
+    )
+
+    llm = CONFIG.get("llm", {}) or {}
+    diagnostics = get_provider_diagnostics()
+    primary = diagnostics.get("primary_route") or {}
+    fallbacks = diagnostics.get("fallback_routes") or []
+
+    # Two different questions, deliberately kept apart. `usable` is the
+    # blocking one: can a question be answered at all. `other_key_exists` is the
+    # helpful one: they have a key, just not for the provider that is selected.
+    usable = configured_provider_has_credential()
+    payload: dict[str, Any] = {
+        "usable": usable,
+        "other_key_exists": has_usable_llm_credential() and not usable,
+        "provider": llm.get("provider"),
+        "model": llm.get("model"),
+        "planner_model": llm.get("planner_model"),
+        "judge_model": llm.get("judge_model"),
+        "config_source": str(CONFIG_SOURCE) if CONFIG_SOURCE else "built-in defaults",
+        "config_source_kind": CONFIG_SOURCE_KIND,
+        "config_layers": [
+            {"kind": kind, "path": str(path)} for kind, path in CONFIG_SOURCE_LAYERS
+        ],
+        "streaming": llm.get("streaming"),
+        "fallbacks": [
+            {
+                "provider": f.get("provider"),
+                "model": f.get("model"),
+                "endpoint": f.get("endpoint"),
+                "key_configured": f.get("api_key_configured"),
+                "status": f.get("status"),
+            }
+            for f in fallbacks
+        ],
+        "exhausted": diagnostics.get("exhausted_providers"),
+        "embeddings": CONFIG.get("embeddings", {}),
+        "vector_store": {
+            "provider": CONFIG.get("vector_store", {}).get("provider"),
+            "mode": CONFIG.get("rag", {}).get("mode"),
+            "fallback_to_chroma": CONFIG.get("vector_store", {}).get("fallback_to_chroma"),
+        },
+        "credentials": credential_status(),
+        "tracing": bool((CONFIG.get("observability") or {}).get("tracing")),
+    }
+
+    def render(d: dict[str, Any]) -> None:
+        # Lead with the one question a user actually has: can I ask a question
+        # right now? Everything below is the detail behind this answer. A user
+        # who has to read to the bottom of a table to learn their key is missing
+        # is the problem this command exists to solve.
+        usable = d["usable"]
+        if usable:
+            formatting.line(
+                f"  [green]Ready.[/green] Asking a question will work: "
+                f"{d['provider']} via {d['model']}."
+            )
+        else:
+            formatting.line(
+                f"  [red]Not ready.[/red] No usable API key for {d['provider']}, "
+                f"so questions will fail."
+            )
+            formatting.line("  [cyan]terminus setup[/cyan] to fix it.")
+        if d["other_key_exists"]:
+            formatting.line(
+                "  [dim]A key for a different provider is configured - "
+                "[cyan]terminus config set llm.provider <name>[/cyan] may be "
+                "all that is needed.[/dim]"
+            )
+        formatting.line("")
+        formatting.heading("Route")
+        formatting.line(f"  provider      : {d['provider']}")
+        formatting.line(f"  model         : {d['model']}")
+        if d["planner_model"] and d["planner_model"] != d["model"]:
+            formatting.line(f"  planner model : {d['planner_model']}")
+        if d["judge_model"] and d["judge_model"] != d["model"]:
+            formatting.line(f"  judge model   : {d['judge_model']}")
+        formatting.line(f"  streaming     : {d['streaming']}")
+        layers = d["config_layers"]
+        if len(layers) > 1:
+            formatting.line("  config layers : (lowest first)")
+            for layer in layers:
+                formatting.line(f"    {layer['kind']:<8} {layer['path']}")
+        else:
+            formatting.line(f"  config source : {d['config_source']}")
+        formatting.line("")
+        formatting.heading("Primary")
+        formatting.line(f"  endpoint      : {primary.get('endpoint')}")
+        formatting.line(
+            f"  api key       : "
+            f"{'configured' if primary.get('api_key_configured') else 'MISSING'}"
+        )
+        # Named for what it measures. "status" next to a MISSING key reads as
+        # "available" contradicting itself; this is only the rate-limit state.
+        formatting.line(f"  rate limited  : {primary.get('status')}")
+        formatting.line("")
+        if d["fallbacks"]:
+            formatting.heading("Fallbacks, in order")
+            for f in d["fallbacks"]:
+                state = "key ok" if f["key_configured"] else "NO KEY"
+                formatting.line(
+                    f"  {f['provider']:<14} {str(f['model'] or 'inherit'):<26} "
+                    f"{state}, rate limited: {f['status']}"
+                )
+        else:
+            formatting.line("  No fallbacks configured.")
+        if d["exhausted"]:
+            formatting.line("")
+            formatting.line(f"  Currently set aside: {d['exhausted']}")
+        formatting.line("")
+        formatting.heading("Retrieval")
+        vs = d["vector_store"]
+        formatting.line(f"  store         : {vs['provider']} / {vs['mode']}")
+        formatting.line(f"  chroma fallback: {'on' if vs['fallback_to_chroma'] else 'off'}")
+        formatting.line(f"  embeddings    : {d['embeddings'].get('provider')} / {d['embeddings'].get('model')}")
+        formatting.line("")
+        formatting.heading("Credentials")
+        for c in d["credentials"]:
+            if c["configured"]:
+                formatting.line(f"  {c['name']:<22} configured  ({c['source']})")
+        missing = [c["name"] for c in d["credentials"] if not c["configured"]]
+        if missing:
+            formatting.line(f"  not set: {', '.join(missing)}")
+        formatting.line("")
+        formatting.line("  Values are never shown. 'terminus doctor' for a full check.")
+
+    formatting.emit(payload, as_json=as_json, render=render)
+
+
+@config_app.command("unset")
+def config_unset(
+    key: str = typer.Argument(..., help="Dotted key to remove, e.g. llm.model."),
+    scope: str = typer.Option("project", "--scope", help="'project' or 'global'."),
+    as_json: bool = typer.Option(False, "--json", help="Emit JSON."),
+) -> None:
+    """Remove a setting from a config file, so a lower layer takes effect again.
+
+    Only meaningful for a file that actually sets the key. Removing it from the
+    project file is how you fall back to your global default.
+    """
+    from terminus.cli_app.settings import unset_value
+
+    try:
+        path, removed = unset_value(key, scope=scope)
+    except KeyError:
+        formatting.usage_error(
+            f"Unknown setting '{key}'.",
+            "Run: terminus config show",
+        )
+        raise typer.Exit(code=2)
+    except ValueError as exc:
+        formatting.usage_error(str(exc))
+        raise typer.Exit(code=2)
+
+    def render(d: dict[str, Any]) -> None:
+        if d["removed"]:
+            formatting.success(f"Removed {d['key']} from {d['path']}")
+        else:
+            formatting.line(f"{d['key']} was not set in {d['path']}; nothing changed.")
+
+    formatting.emit({"key": key, "path": str(path), "removed": removed}, as_json=as_json, render=render)
+
+
 @config_app.command("get")
 def config_get(key: str = typer.Argument(..., help="Dotted key, e.g. llm.model.")) -> None:
     """Read one setting, and report which layer supplies it."""
@@ -119,7 +312,13 @@ def config_get(key: str = typer.Argument(..., help="Dotted key, e.g. llm.model."
 @config_app.command("set")
 def config_set(
     key: str = typer.Argument(..., help="Dotted key, e.g. llm.model."),
-    value: str = typer.Argument(..., help="Value. Parsed as JSON, so numbers and booleans keep their type."),
+    value: str = typer.Argument(..., help="Value. Parsed as JSON, so numbers and booleans ke"),
+    scope: str = typer.Option(
+        "project", "--scope",
+        help="'project' (default) writes this repository's config.yaml. "
+             "'global' writes ~/.terminus/config.yaml, so it applies everywhere. "
+             "A project value overrides a global one for the keys it names.",
+    ),
 ) -> None:
     """Persist a setting to config.yaml."""
     try:
@@ -127,39 +326,84 @@ def config_set(
     except json.JSONDecodeError:
         parsed = value
     try:
-        path, written = settings.set_value(key, parsed)
+        path, written = settings.set_value(key, parsed, scope=scope)
     except KeyError:
         formatting.usage_error(
             f"Unknown setting '{key}'. Nothing was written.",
             "Run: terminus config list",
         )
         raise typer.Exit(code=2)
-    formatting.success(f"{key} = {json.dumps(written, default=str)}   ({path})")
+    except ValueError as exc:
+        formatting.usage_error(str(exc), "Use --scope project or --scope global.")
+        raise typer.Exit(code=2)
+    where = "every project" if scope == "global" else "this project"
+    formatting.success(f"{key} = {json.dumps(written, default=str)}   ({path}, {where})")
+    # Re-resolve in place, so the change applies to the rest of this session.
+    # CONFIG is read once at import; without this, `config set llm.provider x`
+    # in the middle of a session writes the file and then carries on using the
+    # old provider for the next question - which reads as the command doing
+    # nothing. Mutated rather than rebound, because a dozen modules hold a
+    # reference to that exact dict.
+    import terminus.config as config_module
 
-
-# --- agent -----------------------------------------------------------------
+    try:
+        config_module.CONFIG.clear()
+        config_module.CONFIG.update(config_module.load_config())
+    except Exception as exc:  # never fail a successful write over a refresh
+        formatting.warn(f"Saved, but this session is still using the old value: {exc}")
 
 
 @agent_app.callback(invoke_without_command=True)
 def agent_root(
     ctx: typer.Context,
-    prompt: str = typer.Argument(None, help="Prompt to run. Same as -p."),
+    prompt: str = typer.Argument(None, metavar="[PROMPT]", help="Prompt to run, as a positional argument."),
+    prompt_flag: str = typer.Option(
+        None, "--prompt", "-p", metavar="TEXT",
+        help="Prompt to run, as an option. Equivalent to the positional form.",
+    ),
     model: str = typer.Option(None, "--model", "-m", help="Model for this run only. Not persisted."),
     provider: str = typer.Option(None, "--provider", help="Provider for this run only. Not persisted."),
     session: str = typer.Option(None, "--session", "-s", help="Session id to use for this run."),
     plan: bool = typer.Option(False, "--plan", help="Plan for the goal instead of answering it."),
     show_usage: bool = typer.Option(False, "--usage", help="Print a token summary when the run finishes."),
+    dev: bool = typer.Option(
+        False, "--dev",
+        help="Full diagnostic logging for this run. Same as --log-level DEBUG.",
+    ),
 ) -> None:
-    """Bare ``terminus agent`` opens the interactive session.
+    """Run one prompt, or open the interactive session.
 
-    With a prompt it runs once and exits, which is what you want in a script or
-    a hook. Without one you get the REPL, with its slash commands.
+    The prompt can be given either way - positionally, or with -p/--prompt:
+
+        terminus agent "where is the retry logic?"
+        terminus agent -p "where is the retry logic?"
+
+    With no prompt you get the REPL, with its slash commands. The -p form is
+    the documented one because it stays unambiguous when the prompt begins with
+    a dash; the positional form is kept because it reads better in a shell and
+    because it is what this command has always accepted.
     """
     if ctx.invoked_subcommand is not None:
         return
+    if prompt and prompt_flag:
+        # Both spellings of the same argument, with two different values. Picking
+        # one silently would run the wrong question.
+        # format.usage_error rather than typer.UsageError: there is no
+        # `typer.UsageError`, so the obvious spelling raised AttributeError and
+        # the user got a traceback instead of this sentence.
+        formatting.usage_error(
+            "Give the prompt either positionally or with -p/--prompt, not both.",
+            "terminus agent -p \"your prompt\"",
+        )
+        raise typer.Exit(code=2)
+    prompt = prompt or prompt_flag
     if not prompt:
         if model or provider or session or plan:
-            raise typer.UsageError("--model, --provider, --session and --plan all apply to a single prompt.")
+            formatting.usage_error(
+                "--model, --provider, --session and --plan all apply to a single prompt.",
+                "terminus agent -p \"your prompt\" --model <model>",
+            )
+            raise typer.Exit(code=2)
         formatting.line("No prompt given - starting the interactive session. See terminus agent --help.")
         raise typer.Exit(code=formatting.launch_repl())
 
@@ -168,6 +412,12 @@ def agent_root(
     from terminus.agent.orchestrator import handle_query
     from terminus.cli import format_startup_error, initialize, shutdown_resources
     from terminus.memory.session import get_current_session, switch_session
+    from terminus.observability.logging import set_log_level
+
+    if dev:
+        # Also accepted here, because `--dev` before the subcommand is easy to
+        # forget and the agent command is where the noise actually shows up.
+        set_log_level("DEBUG")
 
     with model_override(model, provider):
         thread = session or get_current_session()
@@ -182,7 +432,7 @@ def agent_root(
 
         async def _execute() -> str:
             if plan:
-                from terminus.cli import handle_plan_command
+                from terminus.tasks.orchestrator import handle_plan_command
 
                 return await handle_plan_command(f"Create a plan for: {prompt}")
             return await handle_query(prompt, thread)
@@ -199,9 +449,6 @@ def agent_root(
     formatting.line(answer)
     if show_usage:
         _print_usage(as_json=False)
-
-
-# --- usage -----------------------------------------------------------------
 
 
 def usage_payload() -> dict[str, Any]:
@@ -235,9 +482,6 @@ def _print_usage(as_json: bool) -> None:
             formatting.warn(f"errors: {', '.join(d['errors'])}")
 
     formatting.emit(usage_payload(), as_json=as_json, render=render)
-
-
-# --- sessions --------------------------------------------------------------
 
 
 def _checkpointer_path() -> Path:
@@ -299,9 +543,6 @@ def sessions_switch(session_id: str = typer.Argument(..., help="Session id to sw
         formatting.usage_error(f"Could not switch session: {exc}")
         raise typer.Exit(code=1)
     formatting.success(f"Switched to session: {session_id}")
-
-
-# --- tools -----------------------------------------------------------------
 
 
 def tool_payload() -> list[dict[str, Any]]:
@@ -366,9 +607,6 @@ def tools_inspect(
     )
 
 
-# --- skills ----------------------------------------------------------------
-
-
 @skills_app.callback(invoke_without_command=True)
 def skills_root(ctx: typer.Context,
     json_output: bool = typer.Option(False, "--json", help="Emit JSON."),
@@ -417,9 +655,6 @@ def skills_agents(as_json: bool = typer.Option(False, "--json", help="Emit JSON.
              if d["recent_delegations"] else formatting.line("[dim]No delegations yet.[/dim]")),
         ),
     )
-
-
-# --- db / index ------------------------------------------------------------
 
 
 @db_app.callback(invoke_without_command=True)

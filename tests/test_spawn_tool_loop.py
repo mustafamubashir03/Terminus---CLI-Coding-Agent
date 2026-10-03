@@ -157,12 +157,15 @@ def stub_child_agent(monkeypatch):
             _SEEN_CONTEXTS.append(context)
             return {"messages": [_AI(content="child finished its work")]}
 
-    async def fake_build_agent(tools_override=None, **kw):
-        # The parent calls this with no tool override and must get the real
-        # agent; only the child's call, which always passes tools_override, is
-        # intercepted.
-        if tools_override is None:
-            return await real_build_agent(**kw)
+    is_child = []
+
+    async def fake_build_agent(policy):
+        # The parent runs ask_policy; the child runs child_policy, which is
+        # built from a narrower tool list. That difference is how the two are
+        # told apart here, and it is the same distinction the runtime makes.
+        if len(policy.tools) == len(factory.ASK_TOOLS):
+            return await real_build_agent(policy)
+        is_child.append(sorted(t.name for t in policy.tools))
         return _RecordingAgent()
 
     monkeypatch.setattr(factory, "build_agent", fake_build_agent)
@@ -190,7 +193,7 @@ async def _drive(script: List[Any], user: str, thread_id: str | None = None):
     model = ScriptedModel()
     # factory holds its own reference to get_llm; replace that one.
     factory.get_llm = lambda: model  # type: ignore[assignment]
-    agent = await asyncio.wait_for(factory.build_agent(), timeout=60)
+    agent = await asyncio.wait_for(factory.build_agent(factory.ask_policy()), timeout=60)
     context = ask_context(_no_approval_policy())
     with execution_scope(context):
         result = await asyncio.wait_for(

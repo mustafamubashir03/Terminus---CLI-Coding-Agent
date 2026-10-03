@@ -641,7 +641,7 @@ def test_second_continue_after_a_clean_run_succeeds(store, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_ownership_does_not_widen_permissions(store, tmp_path):
+def test_ownership_does_not_widen_permissions(store, tmp_path, workspace):
     """Holding ownership must not grant any capability on its own."""
     from terminus.execution import execution_scope, task_context
     from terminus.tools.filesystem_tools import write_file

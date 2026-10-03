@@ -18,10 +18,15 @@ asyncio copies per Task.
 What it deliberately does not do
 --------------------------------
 It does not change directory. The workspace is an *identity to validate*, not a
-process-wide setting to mutate; relative tool paths and the shell's working
-directory already resolve to the project the process was started in. chdir is
-process-global and would be exactly the kind of shared mutable state this
-module exists to eliminate.
+process-wide setting to mutate; chdir is process-global and would be exactly the
+kind of shared mutable state this module exists to eliminate.
+
+It also does not resolve the paths a tool is asked for. ``ExecutionContext.
+workspace`` names the directory this execution may act in, and
+``terminus.workspace.resolve_in_workspace`` is what turns that name plus a
+model-supplied path into a real one. Every tool path goes through the latter
+whether or not an execution scope is active, because "no execution" is not a
+reason to be less careful about where a file can be.
 """
 
 from __future__ import annotations

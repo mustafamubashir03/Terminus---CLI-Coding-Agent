@@ -10,7 +10,6 @@ reading it rather than copying it.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import typer
@@ -37,9 +36,6 @@ def _known(provider: str) -> str | None:
     return provider.strip().lower() if provider_table.get(provider) else None
 
 
-# --- providers -------------------------------------------------------------
-
-
 @providers_app.callback(invoke_without_command=True)
 def providers_root(
     ctx: typer.Context,
@@ -60,7 +56,7 @@ def providers_list(as_json: bool = typer.Option(False, "--json", help="Emit JSON
             "provider": name,
             "label": spec.label,
             "auth_method": spec.auth_method,
-            "api_key_configured": any(os.environ.get(key) for key in spec.env_keys),
+            "api_key_configured": provider_table.has_credential(name),
             "credential_env": " or ".join(spec.env_keys),
             "active": name == active,
         }
@@ -124,11 +120,20 @@ def providers_login(
     provider: str = typer.Option(..., "--provider", "-p", help="Provider to configure."),
     method: str = typer.Option(None, "--method", "-m", help="Auth method; api-key is the only one Terminus supports."),
     api_key: str = typer.Option(None, "--api-key", help="Key as an argument. Visible in shell history - prefer the prompt."),
+    scope: str = typer.Option(
+        "global", "--scope",
+        help="'global' (default) stores it for this user, in ~/.terminus, so it "
+             "works in every project. 'project' stores it in this repository's .env.",
+    ),
 ) -> None:
     """Store a provider credential.
 
     Prompts for the key without echoing it. ``--api-key`` is supported for
     scripting but is a poor choice interactively: it lands in shell history.
+
+    Stored globally by default, so one login covers every project. Inside a
+    repository the project's own ``.env`` still wins, which is what you want when
+    a project deliberately uses a different account.
     """
     name = _known(provider)
     spec = provider_table.get(name) if name else None
@@ -159,15 +164,29 @@ def providers_login(
     # two accepted names (google / google_genai) is read under either, so the
     # first is enough and there is no need to ask which one the user prefers.
     env_key = spec.primary_env
-    path = settings.store_credential(env_key, value.strip(), to_stdout=True)
-    formatting.success(f"Stored {env_key} in {path}")
+    from terminus.user_config import store_credential
+
+    try:
+        path = store_credential(env_key, value.strip(), scope=scope)
+    except ValueError as exc:
+        formatting.usage_error(str(exc), "Use --scope global or --scope project.")
+        raise typer.Exit(code=2) from None
+    where = "for this user, in every project" if scope == "global" else "for this project"
+    formatting.success(f"Stored {env_key} {where}: {path}")
     if warned:
         formatting.warn("That key was passed on the command line and may persist in shell history.")
+    formatting.line("  Check it took effect: terminus config show")
 
 
 @providers_app.command("logout")
 def providers_logout(
     provider: str = typer.Option(..., "--provider", "-p", help="Provider to disconnect."),
+    scope: str = typer.Option(
+        "both", "--scope",
+        help="'both' (default) clears the global and project copies; 'global' or "
+             "'project' clears just one. Removing from only one often leaves the "
+             "other still supplying the key, which looks like logout did not work.",
+    ),
 ) -> None:
     """Remove a stored provider credential."""
     name = _known(provider)
@@ -178,14 +197,14 @@ def providers_logout(
             f"Known providers: {', '.join(sorted(provider_table.PROVIDERS))}",
         )
         raise typer.Exit(code=2)
-    path, removed = settings.clear_credential(spec.primary_env)
+    from terminus.user_config import clear_credential
+
+    _, removed = clear_credential(spec.primary_env, scope=scope)
     if removed:
-        formatting.success(f"Removed {spec.primary_env} from {path}")
+        formatting.success(f"Removed {spec.primary_env} (scope: {scope})")
+        formatting.line("  Check it took effect: terminus config show")
     else:
-        formatting.warn(f"No stored {spec.primary_env} in {path}. Nothing to do.")
-
-
-# --- models ----------------------------------------------------------------
+        formatting.warn(f"No stored {spec.primary_env} found (scope: {scope}).")
 
 
 @models_app.callback(invoke_without_command=True)

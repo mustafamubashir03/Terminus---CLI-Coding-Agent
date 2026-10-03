@@ -26,17 +26,20 @@ Requires Python 3.12.
 ```bash
 terminus                                    # interactive session
 terminus agent -p "where is the retry logic?"   # one prompt, then exit
+terminus agent "where is the retry logic?"      # same thing, positionally
 ```
 
-Both reach the same agent. The interactive form is better for a conversation;
-`-p` is what you want in a script, a hook, or a CI step.
+All three reach the same agent. The interactive form is better for a
+conversation; `-p` is what you want in a script, a hook, or a CI step, because
+it stays unambiguous when the prompt begins with a dash. Give the prompt one way
+or the other, not both.
 
 Inside the session, a bare message is treated as a question:
 
 ```
-Query >> how does the auth callback work?
-Query >> /plan add retry handling to the fetcher
-Query >> /help
+terminus › how does the auth callback work?
+terminus › /plan add retry handling to the fetcher
+terminus › /help
 ```
 
 `/help` lists every command. It is generated from the same table the dispatcher

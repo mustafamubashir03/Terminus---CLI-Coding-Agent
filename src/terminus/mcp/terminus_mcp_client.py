@@ -55,10 +55,13 @@ async def get_terminus_mcp_tools() -> list:
             tools = await client.get_tools()
         except Exception:
             logger.exception("Failed to connect to MCP servers; continuing without them")
-            try:
-                await client.__aexit__(None, None, None)
-            except Exception:  # pragma: no cover - best-effort cleanup
-                pass
+            # No cleanup call: langchain-mcp-adapters >= 0.1.0 removed async
+            # context manager support, and ``__aexit__`` is a synchronous stub
+            # that raises NotImplementedError. Calling it (let alone awaiting it -
+            # it is not a coroutine) is both wrong and unnecessary, because the
+            # stdio subprocesses are owned by this process and die with it. This
+            # is the same reasoning as close_terminus_mcp below.
+            _mcp_client = None
             _mcp_tools = []
             return _mcp_tools
 

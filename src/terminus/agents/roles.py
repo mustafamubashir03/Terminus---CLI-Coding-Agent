@@ -20,8 +20,15 @@ from dataclasses import dataclass, field
 READ_TOOLS = ("read_file", "grep", "search_codebase", "list_directory", "file_exists")
 WRITE_TOOLS = ("write_file", "edit_file")
 SHELL_TOOLS = ("run_command",)
-SKILL_TOOLS = ("load_skill",)
 CONTEXT_TOOLS = ("project_status",)
+
+# Observing version state is research: git_log answers "what changed recently",
+# git_diff "what does the pending change look like", git_status "is anything
+# uncommitted". None of them can write. git_commit, git_checkout and git_branch
+# are deliberately absent from every role - a child sharing the parent's
+# working tree could otherwise move the branch its parent is on, or record the
+# parent's unfinished work as a checkpoint.
+GIT_READ_TOOLS = ("git_status", "git_diff", "git_log")
 
 
 @dataclass(frozen=True)
@@ -72,7 +79,7 @@ def _register(role: AgentRole) -> AgentRole:
 _register(AgentRole(
     name="researcher",
     description="Investigates and reports. Read-only: cannot modify files or run commands.",
-    tools=tuple(READ_TOOLS) + CONTEXT_TOOLS,
+    tools=tuple(READ_TOOLS) + CONTEXT_TOOLS + GIT_READ_TOOLS,
     write=False,
     shell=False,
     max_tool_calls=25,
@@ -85,7 +92,7 @@ _register(AgentRole(
 _register(AgentRole(
     name="implementer",
     description="Writes code. Can edit files and run commands within a claimed write scope.",
-    tools=tuple(READ_TOOLS) + WRITE_TOOLS + SHELL_TOOLS + CONTEXT_TOOLS,
+    tools=tuple(READ_TOOLS) + WRITE_TOOLS + SHELL_TOOLS + CONTEXT_TOOLS + GIT_READ_TOOLS,
     write=True,
     shell=True,
     max_tool_calls=40,
@@ -98,7 +105,7 @@ _register(AgentRole(
 _register(AgentRole(
     name="tester",
     description="Runs tests and verifies behaviour. Read and execute, but does not implement fixes.",
-    tools=tuple(READ_TOOLS) + SHELL_TOOLS + CONTEXT_TOOLS,
+    tools=tuple(READ_TOOLS) + SHELL_TOOLS + CONTEXT_TOOLS + GIT_READ_TOOLS,
     write=False,
     shell=True,
     max_tool_calls=30,
@@ -109,7 +116,7 @@ _register(AgentRole(
 _register(AgentRole(
     name="reviewer",
     description="Reviews existing code and reports findings. Strictly read-only.",
-    tools=tuple(READ_TOOLS) + CONTEXT_TOOLS,
+    tools=tuple(READ_TOOLS) + CONTEXT_TOOLS + GIT_READ_TOOLS,
     write=False,
     shell=False,
     max_tool_calls=25,
@@ -120,7 +127,7 @@ _register(AgentRole(
 _register(AgentRole(
     name="debugger",
     description="Diagnoses a failure and reports a root cause. Read-only unless explicitly given a write scope.",
-    tools=tuple(READ_TOOLS) + SHELL_TOOLS + CONTEXT_TOOLS,
+    tools=tuple(READ_TOOLS) + SHELL_TOOLS + CONTEXT_TOOLS + GIT_READ_TOOLS,
     write=False,
     shell=True,
     max_tool_calls=30,

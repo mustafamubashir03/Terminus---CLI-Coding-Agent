@@ -125,7 +125,7 @@ def stub_build(monkeypatch):
 
     monkeypatch.setattr(factory, "get_llm", lambda: "LLM")
     monkeypatch.setattr(factory, "get_summarization_middleware", lambda: "MW")
-    monkeypatch.setattr(factory, "_build_system_prompt", lambda: "PROMPT")
+    monkeypatch.setattr(factory, "_build_system_prompt", lambda *_args, **_kwargs: "PROMPT")
 
     async def fake_checkpointer():
         return "CHECKPOINTER"
@@ -139,8 +139,10 @@ def stub_build(monkeypatch):
 
     monkeypatch.setattr(factory, "create_agent", fake_create_agent)
 
-    async def run(**kwargs):
-        return await factory.build_agent(**kwargs)
+    from terminus.agent.factory import ask_policy
+
+    async def run(policy=None):
+        return await factory.build_agent(policy or ask_policy())
 
     run.captured = captured
     return run
@@ -173,7 +175,7 @@ def test_a_blocking_prompt_is_never_used_without_a_terminal(monkeypatch):
     assert PermissionLevel.WRITE in policy.deny_levels
 
 
-def test_the_scope_is_what_authorises_tools(tmp_path):
+def test_the_scope_is_what_authorises_tools(tmp_path, workspace):
     """A non-interactive /ask run cannot write, because of the scope."""
     victim = tmp_path / "x.txt"
     with execution_scope(ask_context(factory.ask_permission_policy(interactive=False))):
@@ -182,7 +184,7 @@ def test_the_scope_is_what_authorises_tools(tmp_path):
     assert not victim.exists()
 
 
-def test_the_scope_is_restored_afterwards(tmp_path):
+def test_the_scope_is_restored_afterwards(tmp_path, workspace):
     outside = get_permission_policy()
     victim = tmp_path / "y.txt"
     with execution_scope(ask_context(factory.ask_permission_policy(interactive=False))):
@@ -206,9 +208,11 @@ def test_build_agent_passes_the_real_tool_list(stub_build):
     assert stub_build.captured["tools"] == list(factory.ASK_TOOLS)
 
 
-def test_tools_override_replaces_the_default_list(stub_build):
-    """The hook a future child agent (task tool) will use."""
-    asyncio.run(stub_build(tools_override=[run_command]))
+def test_a_policy_replaces_the_default_tool_list(stub_build):
+    """The hook a delegated child uses to get a narrower toolset."""
+    from terminus.agent.factory import AgentPolicy
+
+    asyncio.run(stub_build(AgentPolicy(tools=(run_command,), system_prompt="P")))
     assert stub_build.captured["tools"] == [run_command]
 
 
@@ -276,7 +280,11 @@ def test_identical_command_runs_or_not_purely_by_policy(tmp_path):
         deny_levels=(PermissionLevel.WRITE, PermissionLevel.DESTRUCTIVE)))
     assert call(command).startswith("Refused:")
 
+    # `python -c` is an unrecognised executable, so it needs DESTRUCTIVE
+    # approved. What this test asserts is that the *policy* decides, not where
+    # the command happens to fall.
     shell_tools.set_permission_policy(PermissionPolicy(
-        auto_approve=(PermissionLevel.READ_ONLY, PermissionLevel.WRITE),
-        approver=None, deny_levels=(PermissionLevel.DESTRUCTIVE,)))
+        auto_approve=(PermissionLevel.READ_ONLY, PermissionLevel.WRITE,
+                      PermissionLevel.DESTRUCTIVE),
+        approver=None, deny_levels=()))
     assert not call(command).startswith("Refused:")

@@ -35,16 +35,37 @@ STRICT = PermissionPolicy(
     deny_levels=(PermissionLevel.WRITE, PermissionLevel.DESTRUCTIVE),
 )
 PERMISSIVE = PermissionPolicy(
+        auto_approve=(PermissionLevel.READ_ONLY, PermissionLevel.WRITE,
+                      PermissionLevel.DESTRUCTIVE),
+        approver=None,
+        deny_levels=(),
+    )
+
+
+# PERMISSIVE allows everything, so a test that needs "everything except
+# destructive" installs this instead of relying on PERMISSIVE to mean two things.
+NO_DESTRUCTIVE = PermissionPolicy(
     auto_approve=(PermissionLevel.READ_ONLY, PermissionLevel.WRITE),
     approver=None,
     deny_levels=(PermissionLevel.DESTRUCTIVE,),
 )
 
-
 @pytest.fixture(autouse=True)
 def restore_policy():
     yield
     set_permission_policy(PermissionPolicy())
+
+
+@pytest.fixture(autouse=True)
+def workspace(tmp_path, monkeypatch):
+    """tmp_path is the workspace for every test in this file.
+
+    Containment is a separate boundary from authorisation, and this file is
+    about authorisation, so the paths it uses have to be inside the workspace
+    for the authorisation decision to be the thing under test.
+    """
+    monkeypatch.setenv("TERMINUS_WORKSPACE", str(tmp_path))
+    return tmp_path
 
 
 def _source(tool) -> str:
@@ -253,7 +274,7 @@ def test_no_approver_means_refusal_not_silent_success(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_destructive_shell_still_follows_destructive_policy():
-    set_permission_policy(PERMISSIVE)  # WRITE allowed, DESTRUCTIVE denied
+    set_permission_policy(NO_DESTRUCTIVE)  # WRITE allowed, DESTRUCTIVE denied
     out = rc("rm -rf /")
     assert out.startswith("Refused:")
     assert "destructive" in out
@@ -266,15 +287,15 @@ def test_destructive_shell_allowed_when_policy_permits(monkeypatch):
                       PermissionLevel.DESTRUCTIVE),
         approver=None, deny_levels=(),
     ))
-    monkeypatch.setattr(shell_tools.subprocess, "run",
-                        lambda c, **k: calls.append(c) or _fake_completed())
+    monkeypatch.setattr(shell_tools, "_spawn",
+                        lambda c, cwd: calls.append(c) or _fake_process())
     rc("rm -rf /")
     assert len(calls) == 1
 
 
 def test_delete_operation_is_destructive_not_write():
     """A future delete tool must not be reachable at WRITE level."""
-    set_permission_policy(PERMISSIVE)
+    set_permission_policy(NO_DESTRUCTIVE)
     d = authorize_operation(Operation.DELETE, target="x")
     assert d.allowed is False
     assert d.level is PermissionLevel.DESTRUCTIVE
@@ -301,6 +322,26 @@ def test_filesystem_tools_cannot_bypass_destructive_restrictions(tmp_path):
 def _fake_completed():
     import subprocess
     return subprocess.CompletedProcess(args="", returncode=0, stdout="", stderr="")
+
+def _fake_process():
+    """Stand in for the Popen that ``shell_tools`` now drives.
+
+    ``run_command`` spawns through ``_spawn`` and then talks to the returned
+    process, so a test that wants to observe what reached the operating system
+    has to hand back something with that shape.
+    """
+    class _P:
+        pid = 0
+        returncode = 0
+        stdout = None
+        stderr = None
+
+        def communicate(self, timeout=None):
+            return "", ""
+
+        def kill(self):
+            pass
+    return _P()
 
 
 def _ask_tools():
@@ -435,10 +476,30 @@ def test_success_refusal_and_failure_are_distinguishable(tmp_path):
     assert refused.startswith("Refused:")
     assert "Nothing was changed" in refused
 
+    # A write that got past authorisation and then failed on the filesystem. A
+    # file where a directory has to be, so makedirs itself raises.
     set_permission_policy(PERMISSIVE)
-    failed = wf(tmp_path / "sub" / "\0bad", "x")
+    blocker = tmp_path / "blocker"
+    blocker.write_text("i am a file", encoding="utf-8")
+    failed = wf(blocker / "child.py", "x")
     assert "Refused" not in failed
     assert "Could not write" in failed
+
+
+def test_a_refused_path_is_not_mistaken_for_a_result(tmp_path):
+    """Containment refusal is an error, not a result the model should adapt to.
+
+    ``handle_tool_error`` is what makes this true: the message comes back the way
+    any tool error does, carrying ``status="error"`` when LangGraph builds the
+    ToolMessage. Asserted through a real agent in
+    ``test_tool_observability.py``; here the point is only that the wording is
+    the refusal wording and not a plausible-looking file result.
+    """
+    set_permission_policy(PERMISSIVE)
+    out = wf(tmp_path.parent / "definitely-outside.txt", "x")
+    assert "outside the workspace" in out
+    assert "successfully" not in out
+    assert "No change made" not in out
 
 
 def test_validation_errors_do_not_look_like_permission_errors(tmp_path):
@@ -457,36 +518,50 @@ def test_refusal_does_not_leak_policy_internals(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# path safety: current status, pinned so it cannot change unnoticed
+# path safety: containment is enforced, and it is a different boundary
 # ---------------------------------------------------------------------------
 
-def test_paths_are_not_confinemented_but_are_authorised(tmp_path):
-    """DEFERRED, documented: there is no workspace sandbox.
+def test_paths_outside_the_workspace_are_refused(tmp_path):
+    """A path outside the workspace cannot be reached, whatever the policy says.
 
-    These assertions pin the *current* behaviour so that adding confinement
-    later is a deliberate, visible change rather than an accident. They also
-    record the important consequence: authorisation still applies no matter how
-    unusual the path is.
+    This replaces the assertion that there was no sandbox. ``PERMISSIVE`` allows
+    every *permission* level, so if these are still refused, the refusal can only
+    have come from containment - which is the point of keeping the two boundaries
+    independent.
     """
+    from terminus.tools.filesystem_tools import file_exists, list_directory, read_file
+
     set_permission_policy(PERMISSIVE)
-    outside = tmp_path / "outside"
-    outside.mkdir()
+    outside = tmp_path.parent / "outside-the-workspace"
+    outside.mkdir(exist_ok=True)
 
-    # 1. an absolute path outside the cwd is accepted (no confinement)
-    escaped = outside / "abs.txt"
-    assert "successfully" in wf(escaped, "x")
-    assert escaped.exists()
+    for tool, args in (
+        (write_file, {"file_path": str(outside / "abs.txt"), "content": "x"}),
+        (read_file, {"file_path": str(outside / "abs.txt")}),
+        (file_exists, {"file_path": str(outside / "abs.txt")}),
+        (list_directory, {"directory": str(outside)}),
+        (edit_file, {"file_path": str(outside / "abs.txt"),
+                     "old_text": "x", "new_text": "y"}),
+    ):
+        out = tool.invoke(args)
+        assert "outside the workspace" in out, (tool.name, out)
+    assert list(outside.iterdir()) == []
 
-    # 2. '..' traversal is accepted
-    traversal = tmp_path / "sub" / ".." / "trav.txt"
-    assert "successfully" in wf(traversal, "x")
-    assert (tmp_path / "trav.txt").exists()
+    # '..' traversal out of the workspace is the same refusal, not a different one
+    out = wf(tmp_path / "sub" / ".." / ".." / "trav.txt")
+    assert "outside the workspace" in out
+    assert not (tmp_path.parent / "trav.txt").exists()
 
-    # 3. but authorisation still governs, whatever the path
+    # A path inside still works, and it is reported workspace-relative.
+    ok = write_file.invoke({"file_path": "inside.txt", "content": "x"})
+    assert "File written successfully: inside.txt" in ok
+    assert (tmp_path / "inside.txt").exists()
+
+
+def test_refusal_still_precedes_containment_questions(tmp_path):
+    """A refused write inside the workspace is a permission refusal, not a path one."""
     set_permission_policy(STRICT)
-    assert wf(outside / "denied.txt", "x").startswith("Refused:")
-    assert not (outside / "denied.txt").exists()
+    out = wf(tmp_path / "denied.txt", "x")
+    assert out.startswith("Refused:")
+    assert not (tmp_path / "denied.txt").exists()
 
-    target = outside / "abs.txt"
-    assert ef(target, "x", "y").startswith("Refused:")
-    assert target.read_text(encoding="utf-8") == "x"

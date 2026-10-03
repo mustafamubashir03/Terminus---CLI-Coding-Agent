@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from terminus.config import CONFIG, CONFIG_SOURCE
@@ -286,13 +287,29 @@ def _unavailable(exc: Exception, repo_path: str, provider: str, mode: str) -> Ve
     return error
 
 
-def get_or_create_indexer(repo_path: str, force_reindex: bool = False):
-    """The index alone, for callers that do not need to report which backend.
+#: ``(repo_path, index, ResolvedBackend)`` for the first index this process built.
+_resolved_index: tuple[str, Any, ResolvedBackend] | None = None
 
-    Retained because the existing signature is what ``cli.initialize`` and the
-    REPL call. Prefer :func:`get_or_create_index` where the resolution matters.
+
+def resolve_index(repo_path: str, force_reindex: bool = False):
+    """``(index, ResolvedBackend)``, built on first use and reused after that.
+
+    Opening a session must not wait on a vector store. A remote backend costs a
+    network round trip and a local one costs a lock and a manifest read, and
+    neither is needed to accept the first question - only to answer one that
+    searches the codebase. The retrieval path builds its own store when a search
+    actually happens, so resolving here is purely for callers that want to
+    *report* on the index.
+
+    The result is memoised per repository so repeated calls - the REPL resolving
+    it, then a command displaying it - do not reconnect each time.
     """
-    return get_or_create_index(repo_path, force_reindex)[0]
+    global _resolved_index
+    if _resolved_index is not None and _resolved_index[0] == repo_path:
+        return _resolved_index[1], _resolved_index[2]
+    index, resolved = get_or_create_index(repo_path, force_reindex)
+    _resolved_index = (repo_path, index, resolved)
+    return index, resolved
 
 
 def show_index(index) -> None:
@@ -323,8 +340,8 @@ __all__ = [
     "configured",
     "fallback_enabled",
     "get_or_create_index",
-    "get_or_create_indexer",
     "location_of",
+    "resolve_index",
     "resolved_backend",
     "show_index",
     "validate",

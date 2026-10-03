@@ -24,18 +24,27 @@ PY = sys.executable
 
 @pytest.fixture(autouse=True)
 def default_policy():
-    """Baseline policy for the execution tests: writes allowed, destroys denied.
+    """Approve everything: these tests are about output formatting.
 
-    Running ``python -c ...`` is arbitrary code and is therefore WRITE, not
-    READ_ONLY, so the plumbing tests need writes approved. Tests that are about
-    refusal call ``strict()`` to install the restrictive policy instead.
+    They drive ``python -c "..."`` because that is the only way to produce
+    deterministic stdout, stderr, exit codes and truncation on any platform. An
+    unrecognised executable now classifies as DESTRUCTIVE, which is correct - an
+    interpreter given a one-liner can delete anything - so these tests approve
+    DESTRUCTIVE explicitly rather than depending on the incidental fact that
+    ``python -c`` used to land on WRITE.
+
+    Authorisation itself is tested separately and directly: the classification
+    table below, and ``strict()`` for the refusal paths.
     """
-    policy = PermissionPolicy(
-        auto_approve=(PermissionLevel.READ_ONLY, PermissionLevel.WRITE),
+    set_permission_policy(PermissionPolicy(
+        auto_approve=(
+            PermissionLevel.READ_ONLY,
+            PermissionLevel.WRITE,
+            PermissionLevel.DESTRUCTIVE,
+        ),
         approver=None,
-        deny_levels=(PermissionLevel.DESTRUCTIVE,),
-    )
-    set_permission_policy(policy)
+        deny_levels=(),
+    ))
     yield
     set_permission_policy(PermissionPolicy())
 
@@ -130,7 +139,21 @@ def test_sudo_prefix_does_not_launder_a_command():
 
 
 def test_unknown_command_requires_approval():
-    assert perms.classify_command("some-obscure-binary --do-thing") is PermissionLevel.WRITE
+    """An unrecognised executable must cost a human, not be treated as safe.
+
+    WRITE is auto-approved in an interactive session, so classifying the residual
+    as WRITE would make "Terminus does not recognise this" mean "Terminus will
+    run it" - which is how `python -c "import shutil; shutil.rmtree('/')"` came
+    to be silently permitted.
+    """
+    assert perms.classify_command("some-obscure-binary --do-thing") is PermissionLevel.DESTRUCTIVE
+
+
+def test_a_recognised_command_is_not_penalised_by_the_strict_fallback():
+    """The strict fallback must not swallow commands that are known to be fine."""
+    assert perms.classify_command("pytest -q") is PermissionLevel.WRITE
+    assert perms.classify_command("npm run build") is PermissionLevel.WRITE
+    assert perms.classify_command("grep -rn foo src") is PermissionLevel.READ_ONLY
 
 
 def test_path_prefixed_executable_is_recognised():
@@ -214,10 +237,12 @@ def test_empty_streams_are_labelled():
 
 
 def test_missing_executable_is_handled_cleanly():
-    # needs an approver: an unknown binary is WRITE by policy
+    # About the OSError path, not about authorisation. An unknown binary
+    # classifies as DESTRUCTIVE, so it must be approved to be reached at all.
     set_permission_policy(PermissionPolicy(
-        auto_approve=(PermissionLevel.READ_ONLY, PermissionLevel.WRITE),
-        approver=None, deny_levels=(PermissionLevel.DESTRUCTIVE,),
+        auto_approve=(PermissionLevel.READ_ONLY, PermissionLevel.WRITE,
+                      PermissionLevel.DESTRUCTIVE),
+        approver=None, deny_levels=(),
     ))
     out = call("definitely-not-a-real-binary-xyz --help")
     assert "exit code" in out
@@ -290,13 +315,14 @@ def test_write_command_is_refused_without_approval(tmp_path):
 
 
 def test_destructive_command_is_refused_without_approval():
+    strict()
     out = call("rm -rf /")
     assert out.startswith("Refused:")
     assert "destructive permission is not available" in out
     assert "Nothing was changed" in out
 
 
-def test_refusal_message_shows_command_and_directory(tmp_path):
+def test_refusal_message_shows_command_and_directory(tmp_path, workspace):
     strict()
     out = call("npm install", str(tmp_path))
     assert "npm install" in out

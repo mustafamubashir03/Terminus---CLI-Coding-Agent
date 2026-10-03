@@ -43,6 +43,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 from terminus.permissions import (
+    REFUSAL_PREFIX,
     Operation,
     PermissionDecision,
     PermissionLevel,
@@ -58,6 +59,36 @@ Waiting is bounded rather than indefinite: a lost or wedged holder can never
 freeze a run, and the loser reports back instead of hanging. The invariant is
 unaffected - declining is not overlapping.
 """
+
+DEFERRED_PREFIX = "Deferred:"
+"""The two openings a denial can have, and the whole vocabulary of one.
+
+``REFUSAL_PREFIX`` is imported from :mod:`terminus.permissions`, which is where a
+permission refusal is worded; the pair is declared together here.
+
+Permission refusal is produced by :meth:`PermissionDecision.refusal_message`;
+contention is produced by :meth:`MutationGrant.deferred`. Both are returned to
+the model as an ordinary tool result, which is right - the model has to read it
+and choose - and both are *results*, not attempts that changed something.
+
+:func:`was_performed` exists so that anything downstream which needs to tell a
+real mutation from a refused one reads these two constants instead of
+re-recognising the wording. That is the whole reason they are named.
+"""
+
+
+def was_performed(result: str) -> bool:
+    """Did a mutating tool call actually change anything?
+
+    True for every ordinary result. False when the result is a permission refusal
+    or a contention deferral - the two cases in which the guard declined, the tool
+    body never ran, and whatever path it named is untouched.
+
+    Lives beside the guard because the guard is what produces both strings, and
+    every tool reaches both through it.
+    """
+    text = (result or "").lstrip()
+    return not text.startswith((REFUSAL_PREFIX, DEFERRED_PREFIX))
 
 
 class _LockRegistry:
@@ -141,8 +172,8 @@ class MutationGrant:
         """Set when permission was granted but the project was busy."""
         if self.decision.allowed and self.wanted_lock and not self.locked:
             return (
-                "Deferred: another task is currently writing this project, so "
-                "this operation was not performed. Nothing was changed. Wait for "
+                f"{DEFERRED_PREFIX} another task is currently writing this project, "
+                "so this operation was not performed. Nothing was changed. Wait for "
                 "that task to finish, then try again."
             )
         return None
@@ -180,7 +211,17 @@ def project_write_guard(
     that a project is expected to have a single orchestrator; that assumption is
     preserved here rather than silently extended. Two Terminus processes pointed
     at the same directory remain uncoordinated by design, not by oversight.
+
+    *context* defaults to the active execution's label, so a refusal names the task
+    or agent that hit it rather than looking like a global rule. Tools call this
+    directly; there is no second wrapper to forget to use.
     """
+    if context is None:
+        from terminus.execution import current_execution
+
+        running = current_execution()
+        context = running.label if running else None
+
     decision: PermissionDecision = authorize_operation(
         operation, target, command, context
     )
@@ -188,7 +229,6 @@ def project_write_guard(
         yield MutationGrant(decision, locked=False, wanted_lock=False)
         return
     if decision.level is PermissionLevel.READ_ONLY:
-        # Read-only work never queues behind a writer.
         yield MutationGrant(decision, locked=False, wanted_lock=False)
         return
 

@@ -31,6 +31,27 @@ def _sparse():
     return cached_sparse(SPARSE_MODEL, sparse_retriever)
 
 
+def _dense_embeddings(base):
+    """The dense embedder carried by an existing ``QdrantVectorStore``.
+
+    langchain-qdrant names the constructor argument ``embedding`` but keeps it
+    on the instance as ``_embeddings``; there is no public ``.embedding``. The
+    previous ``base.embedding`` raised AttributeError, which surfaced to the
+    user as "Semantic search is currently unavailable (AttributeError)".
+
+    Falls back to the public constructor argument if a future version renames
+    the attribute, so this does not become the next breakage of the same kind.
+    """
+    for attribute in ("_embeddings", "embedding", "_embedding"):
+        found = getattr(base, attribute, None)
+        if found is not None:
+            return found
+    raise AttributeError(
+        "QdrantVectorStore exposes no embedding attribute; "
+        f"tried _embeddings, embedding, _embedding on {type(base).__name__}"
+    )
+
+
 def _hybrid_store():
     from langchain_qdrant import QdrantVectorStore
 
@@ -38,7 +59,7 @@ def _hybrid_store():
     return QdrantVectorStore(
         client=base.client,
         collection_name=collection_name(),
-        embedding=base.embedding,
+        embedding=_dense_embeddings(base),
         sparse_embedding=_sparse(),
         retrieval_mode=retrieval_mode(),
     )

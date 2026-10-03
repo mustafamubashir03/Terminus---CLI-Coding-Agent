@@ -27,10 +27,6 @@ from terminus.context.qdrant_scope import chunk_metadata
 logger = get_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Result container
-# ---------------------------------------------------------------------------
-
 @dataclass
 class ReindexResult:
     """Statistics returned by an incremental or full reindex run."""
@@ -49,10 +45,6 @@ class ReindexResult:
             f"in {self.elapsed_seconds:.1f}s"
         )
 
-
-# ---------------------------------------------------------------------------
-# Document builder (shared by all providers)
-# ---------------------------------------------------------------------------
 
 def _parse_files_to_documents(filepaths: list[str]) -> tuple[list[Document], int]:
     """Parse *filepaths* into langchain ``Document`` objects.
@@ -83,10 +75,6 @@ def _parse_files_to_documents(filepaths: list[str]) -> tuple[list[Document], int
     return docs, len(docs)
 
 
-# ---------------------------------------------------------------------------
-# Provider helpers: Qdrant
-# ---------------------------------------------------------------------------
-
 def _qdrant_client_and_cfg():
     """Return ``(QdrantClient, collection_name)``.
 
@@ -112,7 +100,6 @@ def _qdrant_delete_points(client: Any, collection: str, filepaths: list[str]) ->
     total_deleted = 0
     for fp in filepaths:
         try:
-            # Count how many points exist for this source path
             count_before = client.count(
                 collection_name=collection,
                 count_filter=Filter(
@@ -196,22 +183,28 @@ def _qdrant_upsert_documents(
 
 
 def _qdrant_wipe_collection(client: Any, collection: str) -> None:
-    """Delete ALL points from a Qdrant collection (keeps schema)."""
-    from qdrant_client.models import Filter
+        """Delete this project's points from a Qdrant collection (keeps schema).
 
-    try:
-        client.delete(
-            collection_name=collection,
-            points_selector=Filter(must=[]),  # match all
-        )
-        logger.info(f"Wiped all points from {collection}")
-    except Exception as exc:
-        logger.warning(f"Wipe failed (may already be empty): {exc}")
+        Scoped to the current project, deliberately. The collection is shared by
+        every project - ``qdrant_scope`` exists precisely because of that - so
+        the previous ``Filter(must=[])``, which matches every point, meant that
+        running a full index in any new project silently destroyed every other
+        project's data. Observed doing exactly that: a second project dropped a
+        554-point shared collection to 4.
+        """
+        from terminus.context.qdrant_scope import project_filter
 
+        try:
+            client.delete(
+                collection_name=collection,
+                points_selector=project_filter(),
+            )
+            logger.info(
+                "Removed this project's points from %s", collection
+            )
+        except Exception as exc:
+            logger.warning(f"Project wipe failed (may already be empty): {exc}")
 
-# ---------------------------------------------------------------------------
-# Provider helpers: ChromaDB
-# ---------------------------------------------------------------------------
 
 def _chroma_collection(repo_path: str | None = None):
     """Return ``(chromadb.Collection, chromadb_client)``."""
@@ -285,10 +278,6 @@ def _chroma_wipe_collection(collection: Any) -> None:
         logger.warning(f"ChromaDB wipe failed: {exc}")
 
 
-# ---------------------------------------------------------------------------
-# Provider dispatch
-# ---------------------------------------------------------------------------
-
 def _get_provider() -> str:
     return CONFIG["vector_store"]["provider"]
 
@@ -296,10 +285,6 @@ def _get_provider() -> str:
 def _get_mode() -> str:
     return CONFIG["rag"]["mode"]
 
-
-# ---------------------------------------------------------------------------
-# Core: incremental reindex
-# ---------------------------------------------------------------------------
 
 def incremental_reindex(repo_path: str) -> tuple[Any, ReindexResult]:
     """Diff-based reindex: only process files that changed since last index.
@@ -310,9 +295,6 @@ def incremental_reindex(repo_path: str) -> tuple[Any, ReindexResult]:
     result = ReindexResult()
     provider = _get_provider()
 
-    # 1. Load previous manifest and snapshot current state (fast stat pass).
-    #    Only files whose mtime/size changed get a SHA-256 hash inside
-    #    ``compute_diff`` — untouched files never touch the disk content.
     manifest = Manifest.load(repo_path)
 
     # If there is no baseline manifest but the collection already has points,
@@ -328,25 +310,21 @@ def incremental_reindex(repo_path: str) -> tuple[Any, ReindexResult]:
 
     current = Manifest.snapshot_directory_fast(repo_path)
 
-    # 2. Compute diff (hashes only stat-changed files)
     diff = manifest.compute_diff(current, repo_path)
 
     if not diff.has_changes:
         logger.info("Index is up to date — no changes detected")
-        # Still need to return the existing vector store
         vs = _connect_existing(provider, repo_path)
         result.elapsed_seconds = time.time() - t0
         return vs, result
 
-    # 3. Parse new + modified files into documents
     files_to_index = diff.added + diff.modified
     docs, chunk_count = _parse_files_to_documents(files_to_index)
 
-    # 4. Delete points for deleted + modified files (modified = old points
+    # Delete points for deleted + modified files (modified = old points
     #    removed first, then new points added)
     files_to_delete = diff.deleted + diff.modified
 
-    # 5. Apply changes to the provider
     if provider == "qdrant":
         _apply_qdrant_incremental(
             diff, docs, chunk_count, files_to_delete, result
@@ -358,7 +336,7 @@ def incremental_reindex(repo_path: str) -> tuple[Any, ReindexResult]:
     else:
         raise ValueError(f"Unknown vector store provider: {provider}")
 
-    # 6. Merge manifest: keep full snapshots for unchanged files, use the
+    # Merge manifest: keep full snapshots for unchanged files, use the
     #    freshly-hashed entries for added/modified files.  Deleted files
     #    are naturally dropped because they no longer exist in ``current``.
     updated: dict[str, FileSnapshot] = {}
@@ -390,30 +368,33 @@ def _apply_qdrant_incremental(
     result: ReindexResult,
 ) -> None:
     """Apply incremental changes to a Qdrant collection."""
+    # The function is `retrieval_mode`; this import previously asked for
+    # `get_retrieval_mode`, which does not exist. The resulting ImportError was
+    # then wrapped as VectorStoreUnavailableError, so a typo in a local import
+    # was reported to the user as an unreachable vector store. Aliased because
+    # `retrieval_mode` is also the name of a local below and of a parameter in
+    # the helper it is passed to.
     from terminus.context.indexers.hybrid_qdrant import (
-        get_retrieval_mode,
+        retrieval_mode as _configured_retrieval_mode,
     )
     from terminus.llm.factory import get_embedder
 
     client, collection = _qdrant_client_and_cfg()
     embedder = get_embedder()
 
-    # Ensure metadata.source is indexed so filtered deletions work
     _ensure_source_payload_index(client, collection)
 
-    # Delete stale points
     deleted_count = _qdrant_delete_points(client, collection, files_to_delete)
     result.chunks_removed = deleted_count
     logger.info(f"Deleted {deleted_count} stale points from Qdrant")
 
-    # Upsert new documents
     if docs:
         mode = _get_mode()
         if mode == "hybrid":
             from langchain_qdrant import FastEmbedSparse
 
             sparse = FastEmbedSparse(model_name="Qdrant/bm25")
-            retrieval_mode = get_retrieval_mode()
+            retrieval_mode = _configured_retrieval_mode()
             _qdrant_upsert_documents(
                 docs, embedder, sparse, retrieval_mode,
                 client, collection,
@@ -445,19 +426,13 @@ def _apply_chroma_incremental(
     collection, _client = _chroma_collection(repo_path)
     embedder = get_embedder()
 
-    # Delete stale points
     deleted_count = _chroma_delete_points(collection, files_to_delete)
     result.chunks_removed = deleted_count
     logger.info(f"Deleted {deleted_count} stale points from ChromaDB")
 
-    # Upsert new documents
     added = _chroma_upsert_documents(docs, embedder, collection)
     logger.info(f"Upserted {added} new/updated chunks into ChromaDB")
 
-
-# ---------------------------------------------------------------------------
-# Core: full reindex
-# ---------------------------------------------------------------------------
 
 def full_reindex(repo_path: str) -> tuple[Any, ReindexResult]:
     """Wipe-and-rebuild: re-index every source file from scratch.
@@ -468,14 +443,11 @@ def full_reindex(repo_path: str) -> tuple[Any, ReindexResult]:
     result = ReindexResult()
     provider = _get_provider()
 
-    # 1. Snapshot current directory
     current = Manifest.snapshot_directory(repo_path)
 
-    # 2. Parse ALL files
     all_files = list(current.keys())
     docs, chunk_count = _parse_files_to_documents(all_files)
 
-    # 3. Wipe existing collection and rebuild
     if provider == "qdrant":
         _apply_qdrant_full(docs, chunk_count, result)
     elif provider in ("chromadb", "chroma"):
@@ -483,7 +455,6 @@ def full_reindex(repo_path: str) -> tuple[Any, ReindexResult]:
     else:
         raise ValueError(f"Unknown vector store provider: {provider}")
 
-    # 4. Create fresh manifest
     manifest = Manifest(
         repo_path=repo_path,
         files=current,
@@ -506,25 +477,25 @@ def _apply_qdrant_full(
     docs: list[Document], chunk_count: int, result: ReindexResult,
 ) -> None:
     """Full wipe-and-rebuild for Qdrant."""
-    from terminus.context.indexers.hybrid_qdrant import get_retrieval_mode
+    # Same rename as in _apply_qdrant_incremental above; see the comment there.
+    from terminus.context.indexers.hybrid_qdrant import (
+        retrieval_mode as _configured_retrieval_mode,
+    )
     from terminus.llm.factory import get_embedder
 
     client, collection = _qdrant_client_and_cfg()
     embedder = get_embedder()
 
-    # Ensure metadata.source is indexed so filtered deletions work
     _ensure_source_payload_index(client, collection)
 
-    # Wipe
     _qdrant_wipe_collection(client, collection)
 
-    # Rebuild
     mode = _get_mode()
     if mode == "hybrid":
         from langchain_qdrant import FastEmbedSparse
 
         sparse = FastEmbedSparse(model_name="Qdrant/bm25")
-        retrieval_mode = get_retrieval_mode()
+        retrieval_mode = _configured_retrieval_mode()
         _qdrant_upsert_documents(
             docs, embedder, sparse, retrieval_mode,
             client, collection,
@@ -556,18 +527,12 @@ def _apply_chroma_full(
     collection, _client = _chroma_collection(repo_path)
     embedder = get_embedder()
 
-    # Wipe
     _chroma_wipe_collection(collection)
 
-    # Rebuild
     added = _chroma_upsert_documents(docs, embedder, collection)
     result.chunks_added = added
     logger.info(f"Full ChromaDB rebuild: {added} chunks")
 
-
-# ---------------------------------------------------------------------------
-# Connect to existing collection (for returning to callers)
-# ---------------------------------------------------------------------------
 
 def _connect_existing(provider: str, repo_path: str) -> Any:
     """Return a connected vector store / collection (read-only, no reindex)."""
@@ -598,7 +563,13 @@ def _connect_existing(provider: str, repo_path: str) -> Any:
             )
             kwargs["retrieval_mode"] = RetrievalMode.HYBRID
 
-        return QdrantVectorStore.from_existing_collection(**kwargs)
+        # The constructor, not from_existing_collection. The classmethod builds
+        # its own client from url/host/port and has no `client` parameter, so
+        # passing one raised TypeError: Client.__init__() got an unexpected
+        # keyword argument 'client'. The constructor takes the same arguments
+        # and is the documented equivalent for an existing collection, and it is
+        # what the retriever already uses successfully.
+        return QdrantVectorStore(**kwargs)
     if provider in ("chromadb", "chroma"):
         collection, _ = _chroma_collection(repo_path)
         return collection

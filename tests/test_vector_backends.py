@@ -747,3 +747,109 @@ def test_typed_thread_safety_of_the_cache():
 
     assert len(results) == 4
     assert all(r is results[0] for r in results), "concurrent callers got different stores"
+
+
+# --- the hybrid write path, against a real local engine ----------------------
+#
+# This is the test whose absence let a real defect ship. `write_documents`
+# forwarded `sparse_embedding` to `add_documents`, which passes unknown keywords
+# to `QdrantClient.upsert`, which accepts and discards them. The collection was
+# therefore created dense-only, the BM25 model was loaded and paid for, and the
+# hybrid retriever then refused the collection it had just written to. The tool
+# reported that as "semantic search is currently unavailable", so the agent fell
+# back to grep and the user was never told why.
+#
+# The test that should have caught it stubbed out `write_documents` itself.
+
+
+@pytest.fixture
+def hybrid_store(isolated_store, monkeypatch):
+    monkeypatch.setitem(CONFIG["vector_store"], "retrieval_mode", "hybrid")
+    monkeypatch.setitem(CONFIG["rag"], "mode", "hybrid")
+    retrieval_cache.reset()
+    return isolated_store
+
+
+def test_hybrid_write_creates_a_sparse_capable_collection(hybrid_store):
+    """The collection must be born with the sparse schema.
+
+    Qdrant cannot add a sparse vector name to an existing collection, so a
+    dense-only collection is permanently unusable for hybrid retrieval.
+    """
+    from langchain_core.documents import Document
+    from langchain_qdrant import FastEmbedSparse, RetrievalMode
+
+    from terminus.context.indexers.qdrant_store import write_documents
+
+    client = qdrant_client.create_qdrant_client()
+    write_documents(
+        client,
+        [Document(page_content="retry the upload on failure", metadata={})],
+        "hybrid_write_test",
+        sparse_embedding=FastEmbedSparse(model_name="Qdrant/bm25"),
+        retrieval_mode=RetrievalMode.HYBRID,
+    )
+
+    config = client.get_collection("hybrid_write_test").config
+    sparse_names = set(config.params.sparse_vectors or {})
+    assert sparse_names == {"langchain-sparse"}, (
+        f"expected a langchain-sparse schema, found {sparse_names}"
+    )
+
+
+def test_hybrid_write_then_retrieve_returns_the_document(hybrid_store, monkeypatch):
+    """write -> index -> retrieve, end to end, on a real engine."""
+    from langchain_core.documents import Document
+    from langchain_qdrant import FastEmbedSparse, RetrievalMode
+
+    from terminus.context.indexers import qdrant_store
+    from terminus.context.retrievers import hybrid_qdrant
+
+    monkeypatch.setitem(CONFIG["qdrant"], "collection_name", "hybrid_roundtrip")
+    monkeypatch.setattr(
+        hybrid_qdrant, "sparse_retriever", lambda: FastEmbedSparse(model_name="Qdrant/bm25")
+    )
+    retrieval_cache.reset()
+
+    qdrant_store.write_documents(
+        qdrant_client.create_qdrant_client(),
+        [
+            Document(
+                page_content="def upload_with_retry(blob): retries on 503",
+                metadata={
+                    "source": "uploader.py",
+                    "name": "upload_with_retry",
+                    "type": "function",
+                    "start_line": 10,
+                    "end_line": 40,
+                    "project": str(hybrid_store),
+                },
+            )
+        ],
+        "hybrid_roundtrip",
+        sparse_embedding=FastEmbedSparse(model_name="Qdrant/bm25"),
+        retrieval_mode=RetrievalMode.HYBRID,
+    )
+    retrieval_cache.reset()
+
+    results = hybrid_qdrant.retrieve("upload retry", k=3)
+    assert results, "hybrid retrieval returned nothing from a store it just wrote to"
+    assert "upload" in results[0]["text"]
+
+
+def test_dense_write_leaves_the_collection_dense(hybrid_store):
+    """A dense store must not grow a sparse schema the dense retriever ignores."""
+    from langchain_core.documents import Document
+    from langchain_qdrant import RetrievalMode
+
+    from terminus.context.indexers.qdrant_store import write_documents
+
+    client = qdrant_client.create_qdrant_client()
+    write_documents(
+        client,
+        [Document(page_content="dense only", metadata={})],
+        "dense_write_test",
+        retrieval_mode=RetrievalMode.DENSE,
+    )
+    config = client.get_collection("dense_write_test").config
+    assert not (config.params.sparse_vectors or {})

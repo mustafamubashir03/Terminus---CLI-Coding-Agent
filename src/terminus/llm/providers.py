@@ -61,10 +61,31 @@ class Provider:
 
     auth_method: str = "api-key"
 
+    key_required: bool = True
+    """Whether a missing credential should be an error.
+
+    False for a local server that accepts any key: refusing to start because
+    ``localhost`` has no API key would be a rule, not a safety property.
+    """
+
+    base_url_env: str = ""
+    """Environment variable that overrides :attr:`base_url`.
+
+    For endpoints that are not at a fixed public address - a model server on the
+    developer's own machine, on whatever port it happens to be using.
+    """
+
     @property
     def primary_env(self) -> str:
         """The variable named in error messages when nothing is configured."""
         return self.env_keys[0] if self.env_keys else ""
+
+    def resolved_base_url(self) -> str:
+        """:attr:`base_url`, or the override if the environment sets one."""
+        import os
+
+        override = os.getenv(self.base_url_env, "").strip() if self.base_url_env else ""
+        return override or self.base_url
 
 
 PROVIDERS: dict[str, Provider] = {
@@ -124,6 +145,17 @@ PROVIDERS: dict[str, Provider] = {
         Provider(name="fireworks", label="Fireworks", env_keys=("FIREWORKS_API_KEY",)),
         Provider(name="cerebras", label="Cerebras", env_keys=("CEREBRAS_API_KEY",)),
         Provider(name="anthropic", label="Anthropic", env_keys=("ANTHROPIC_API_KEY",)),
+        Provider(
+            name="ollama",
+            label="Ollama (local)",
+            env_keys=("OLLAMA_API_KEY",),
+            base_url="http://localhost:11434/v1",
+            endpoint="http://localhost:11434/v1/chat/completions",
+            base_url_env="OLLAMA_BASE_URL",
+            api_kind="chat_completions",
+            models=("qwen3:8b",),
+            key_required=False,
+        ),
     )
 }
 
@@ -132,7 +164,9 @@ PROVIDERS: dict[str, Provider] = {
 
 #: Providers Terminus constructs itself rather than delegating to
 #: ``langchain.chat_models.init_chat_model``.
-BUILT_LOCALLY = frozenset({"cohere", "openrouter", "google_genai", "google", "groq"})
+BUILT_LOCALLY = frozenset(
+    {"cohere", "openrouter", "google_genai", "google", "groq", "ollama"}
+)
 
 NON_LLM_CREDENTIALS = ("QDRANT_API_KEY", "CLUSTER_ENDPOINT")
 """Credentials Terminus uses that are not LLM provider keys.
@@ -161,7 +195,18 @@ def credential_env_names() -> tuple[str, ...]:
     return tuple(dict.fromkeys(names))
 
 
-def known_models(provider: str) -> tuple[str, ...]:
-    """Models *provider* is known to serve."""
+def has_credential(provider: str) -> bool:
+    """Can *provider* be called right now?
+
+    The single answer to "is this provider usable", so the CLI table, the setup
+    wizard and the REPL's start-up check cannot disagree about whether a provider
+    is available.
+    """
+    import os
+
     spec = get(provider)
-    return spec.models if spec else ()
+    if spec is None:
+        return False
+    if any(os.environ.get(key) for key in spec.env_keys):
+        return True
+    return not spec.key_required

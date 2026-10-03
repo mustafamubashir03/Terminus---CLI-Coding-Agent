@@ -30,6 +30,15 @@ from typing import Callable
 from collections.abc import Iterable
 
 
+REFUSAL_PREFIX = "Refused:"
+"""The opening every permission refusal begins with.
+
+Named here because this module owns that wording, and
+:mod:`terminus.coordination` reads it back through :func:`was_performed`, so one
+place decides what a refusal looks like rather than two.
+"""
+
+
 class PermissionLevel(str, Enum):
     """How much a command is trusted to do."""
 
@@ -74,7 +83,6 @@ _OPERATION_LEVELS: dict[Operation, PermissionLevel] = {
 # Classification tables (extend these; do not edit the logic below)
 # ---------------------------------------------------------------------------
 
-# Exact executable names that only observe state.
 READ_ONLY_COMMANDS = frozenset({
     "pwd", "ls", "dir", "echo", "printf", "cat", "type", "head", "tail", "wc",
     "which", "where", "whoami", "hostname", "uname", "date", "env", "printenv",
@@ -88,7 +96,6 @@ READ_ONLY_COMMANDS = frozenset({
 # Commands that are only read-only in certain sub-argument shapes, matched as
 # regexes against the whole segment. First match wins.
 READ_ONLY_PATTERNS: tuple[tuple[re.Pattern, PermissionLevel], ...] = (
-    # version probes
     (re.compile(r"^\s*(python[\d.]*|py)\s+(-V|--version)\s*$"), PermissionLevel.READ_ONLY),
     (re.compile(r"^\s*(python[\d.]*|py)\s+-c\s+.*--version\s*$"), PermissionLevel.READ_ONLY),
     (re.compile(r"^\s*node\s+(--version|-v)\s*$"), PermissionLevel.READ_ONLY),
@@ -96,7 +103,6 @@ READ_ONLY_PATTERNS: tuple[tuple[re.Pattern, PermissionLevel], ...] = (
     (re.compile(r"^\s*(pip[\d.]*|uv|poetry|conda)\s+(--version|-V)\s*$"), PermissionLevel.READ_ONLY),
     (re.compile(r"^\s*(cargo|rustc|go|java|javac|ruby|gem|dotnet|git)\s+(--version|-v)\s*$"),
      PermissionLevel.READ_ONLY),
-    # read-only test introspection
     (re.compile(r"^\s*(pytest|py\.test)\b.*--collect-only"), PermissionLevel.READ_ONLY),
     (re.compile(r"^\s*(pytest|py\.test)\b.*--list-tests"), PermissionLevel.READ_ONLY),
     (re.compile(r"^\s*python[\d.]*\s+-m\s+(pytest|py\.test)\b.*--collect-only"),
@@ -109,18 +115,15 @@ READ_ONLY_PATTERNS: tuple[tuple[re.Pattern, PermissionLevel], ...] = (
     (re.compile(r"^\s*(pip[\d.]*)\s+(list|show|freeze|config)\b"), PermissionLevel.READ_ONLY),
 )
 
-# git subcommands that only read.
 GIT_READ_ONLY_SUBCOMMANDS = frozenset({
     "status", "diff", "log", "show", "blame", "reflog", "describe", "rev-parse",
     "ls-files", "ls-tree", "ls-remote", "cat-file", "shortlog", "whatchanged",
     "annotate", "grep", "remote", "config", "branch", "tag", "stash",
 })
-# git subcommands that destroy local or remote state.
 GIT_DESTRUCTIVE_SUBCOMMANDS = frozenset({
     "clean", "reset", "rebase", "filter-branch", "filter-repo", "gc", "prune",
     "push", "reflog",
 })
-# git subcommands that modify the working tree or history.
 GIT_WRITE_SUBCOMMANDS = frozenset({
     "add", "commit", "checkout", "switch", "restore", "merge", "cherry-pick",
     "revert", "am", "apply", "mv", "rm", "worktree", "submodule", "notes",
@@ -129,7 +132,7 @@ GIT_WRITE_SUBCOMMANDS = frozenset({
 
 # Substrings that mark a command as destructive regardless of the executable.
 DESTRUCTIVE_PATTERNS: tuple[re.Pattern, ...] = (
-    re.compile(r"(?<![\w./\\-])rm(\.exe)?\s+"),                        # any rm
+    re.compile(r"(?<![\w./\\-])rm(\.exe)?\s+"),
     re.compile(r"\brmdir\b"), re.compile(r"\bshred\b"), re.compile(r"\bdel\b"),
     re.compile(r"\bformat\s+[a-zA-Z]:"), re.compile(r"\bmkfs\b"),
     re.compile(r"\bdd\s+if="), re.compile(r"\bfdisk\b"), re.compile(r"\bdiskpart\b"),
@@ -157,6 +160,11 @@ WRITE_PATTERNS: tuple[re.Pattern, ...] = (
     re.compile(r"\b(pip[\d.]*|pip3)\s+install\b"), re.compile(r"\buv\s+(add|sync|pip\s+install)\b"),
     re.compile(r"\bpoetry\s+(add|install|lock|update)\b"), re.compile(r"\bconda\s+install\b"),
     re.compile(r"\b(npm|pnpm|yarn|bun)\s+(install|add|i|update|remove|uninstall|ci)\b"),
+    # `npm run <script>` executes a script from package.json, which is the same
+    # class of thing as `make build` - arbitrary project code, but not itself
+    # destructive. Without this it fell through to the unknown-executable
+    # fallback and asked for approval on every build.
+    re.compile(r"\b(npm|pnpm|yarn|bun)\s+(run|run-script|exec|test|start|build)\b"),
     re.compile(r"\b(pytest|py\.test|tox|nox|unittest)\b"),
     re.compile(r"\b(pyright|mypy|ruff|flake8|black|isort|pylint|eslint|prettier|tsc|biome)\b"),
     re.compile(r"\b(cargo|go|gradle|gradlew|maven|mvn|make|cmake|ninja)\s+(build|test|run|check|install|compile|vet)\b"),
@@ -167,9 +175,25 @@ WRITE_PATTERNS: tuple[re.Pattern, ...] = (
 )
 
 # Command chaining: a chain is only as safe as its most dangerous segment.
-_CHAIN_SPLIT = re.compile(r"(?:&&|\|\||;|\||&|\n)")
+#
+# The `&` case is guarded on both sides. A bare `&` really is a backgrounding
+# operator and must split, but the `&` in `2>&1` or `&>file` is part of a
+# descriptor redirect, and splitting there left a junk trailing segment (`"1"`)
+# that no executable table recognises - so `npm test 2>&1 | head` classified as
+# DESTRUCTIVE. Failing closed is safe, and also bad: a prompt that fires on
+# ordinary commands is a prompt people stop reading.
+_CHAIN_SPLIT = re.compile(r"(?:&&|\|\||;|\||\n|(?<![<>])&(?![0-9>]))")
 
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# An output redirect writes a file no matter what the command is. Matched on the
+# whole segment rather than as an argument, because the executable-name tables
+# below are blind to it: as far as `echo` is concerned, `echo hi > out.txt` is
+# still `echo`, so it classified READ_ONLY and wrote a file with no approval and
+# no writer lock. `-` and `<` are excluded so `->` and `<>` do not match, and
+# `>&\d` is excluded because duplicating a descriptor writes nothing - otherwise
+# `grep x f 2>&1` would need approval for a stream copy.
+_OUTPUT_REDIRECT = re.compile(r"(?<![-<>])>{1,2}(?!&\s*\d)")
 
 # Windows executable suffixes, stripped so a table entry like "python" also
 # matches "python.exe".
@@ -233,7 +257,6 @@ def _normalized(segment: str, executable: str) -> str:
 _SECRET_NAME = re.compile(
     r"(?i)(api[_-]?key|secret|token|password|passwd|credential|private[_-]?key|auth)"
 )
-# Redaction patterns for anything a command might print.
 _SECRET_VALUE_PATTERNS: tuple[re.Pattern, ...] = (
     re.compile(r"(?i)authorization\s*[:=]\s*bearer\s+\S+"),
     re.compile(r"(?i)\b(?:api[_-]?key|access[_-]?token|secret|password)\b\s*[:=]\s*\S+"),
@@ -261,7 +284,17 @@ def sanitized_env() -> dict[str, str]:
 
 
 def _git_level(segment: str) -> PermissionLevel | None:
-    """Classify a `git ...` segment, or None if it is not a git command."""
+    """Classify a `git ...` segment, or None if it is not a git command.
+
+    This is a *policy* classifier for shell text, not an interface to Git. It
+    exists because ``run_command`` takes a command string a model typed, and that
+    string may begin with ``git``. The deliberate Git capabilities live in
+    ``tools/git_tools.py`` and reach the runtime through ``Operation.WRITE`` /
+    ``Operation.READ`` instead, so they never pass through here. Both paths are
+    needed and they are not two implementations of the same thing: one grades
+    text the model supplied to a shell, the other is the whole of what the agent
+    can ask Git to do.
+    """
     tokens = segment.split()
     git_at = None
     for i, token in enumerate(tokens):
@@ -305,6 +338,11 @@ def _classify_segment(segment: str) -> PermissionLevel:
         if pattern.search(normalized):
             return PermissionLevel.DESTRUCTIVE
 
+    # After deny, before the read-only tables: a redirect is a write regardless
+    # of which command performs it.
+    if _OUTPUT_REDIRECT.search(normalized):
+        return PermissionLevel.WRITE
+
     for pattern, level in READ_ONLY_PATTERNS:
         if pattern.match(normalized):
             return level
@@ -316,8 +354,12 @@ def _classify_segment(segment: str) -> PermissionLevel:
         if pattern.search(normalized):
             return PermissionLevel.WRITE
 
-    # Unknown executable: require approval rather than assuming it is safe.
-    return PermissionLevel.WRITE
+    # An unrecognised executable gets DESTRUCTIVE, which no policy auto-approves.
+    # WRITE is auto-approved in an interactive session, so returning it here would
+    # mean "unrecognised" silently means "allowed" - the opposite of what it looks
+    # like. Every command Terminus recognises on purpose reached one of the three
+    # checks above; this is the residual, and the residual should cost a human.
+    return PermissionLevel.DESTRUCTIVE
 
 
 def classify_command(command: str) -> PermissionLevel:
@@ -333,14 +375,20 @@ def classify_command(command: str) -> PermissionLevel:
     """
     raw = (command or "").strip()
     if not raw:
-        return PermissionLevel.WRITE
+        # Nothing to run, so there is nothing to approve. Return the level that
+        # asks for a human rather than the one that grants itself: a caller that
+        # ignores the empty-command check upstream should not find that an
+        # unparseable string was the cheapest thing to authorise.
+        return PermissionLevel.DESTRUCTIVE
     for pattern in DESTRUCTIVE_PATTERNS:
         if pattern.search(raw):
             return PermissionLevel.DESTRUCTIVE
 
     segments = _split_segments(raw)
     if not segments:
-        return PermissionLevel.WRITE
+        # Only separators, e.g. "&&" or "|". The shell will fail on it, but it is
+        # still not a command anyone approved.
+        return PermissionLevel.DESTRUCTIVE
     level = PermissionLevel.READ_ONLY
     for segment in segments:
         level = max(level, _classify_segment(segment), key=lambda lvl: lvl.rank)
@@ -372,18 +420,18 @@ class PermissionDecision:
         where = f" (during {self.context})" if self.context else ""
         if "rejected by user" in self.reason:
             return (
-                f"Refused:{what} - the user declined to allow this "
+                f"{REFUSAL_PREFIX}{what} - the user declined to allow this "
                 f"{self.level.value} operation{where}. Nothing was changed. "
                 "Do not retry it; ask the user how to proceed."
             )
         if self.requires_approval or "requires" in self.reason:
             return (
-                f"Refused:{what} - this {self.level.value} operation needs human "
+                f"{REFUSAL_PREFIX}{what} - this {self.level.value} operation needs human "
                 f"approval, and no approver is available{where}. "
                 "Nothing was changed. Report this to the user instead of retrying."
             )
         return (
-            f"Refused:{what} - {self.level.value} permission is not available{where}. "
+            f"{REFUSAL_PREFIX}{what} - {self.level.value} permission is not available{where}. "
             "Nothing was changed. "
             "Do not attempt to work around this; tell the user what you wanted to do."
         )
@@ -493,10 +541,6 @@ class PermissionPolicy:
                           ) -> PermissionDecision:
         return self.authorize(classify_command(command), command, working_directory)
 
-
-# ---------------------------------------------------------------------------
-# The one process-wide policy. Every mutating tool goes through this.
-# ---------------------------------------------------------------------------
 
 def classify_operation(operation: Operation, command: str | None = None) -> PermissionLevel:
     """Level required by an operation.

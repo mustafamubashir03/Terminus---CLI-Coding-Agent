@@ -13,12 +13,15 @@ Two rules keep these tests honest:
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
 from terminus.cli_app import app
 from terminus.cli_app import formatting, settings
+from terminus.config import CONFIG
 
 runner = CliRunner()
 
@@ -303,14 +306,43 @@ def test_login_writes_the_key_to_env_not_config(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = run("providers", "login", "-p", "groq", "--api-key", "test-key-value")
     assert result.exit_code == 0
+    # The default scope is global, so one login serves every project. The point
+    # of the assertion is unchanged: the value went to an env file, and nowhere
+    # that gets committed.
+    stored = (Path.home() / ".terminus" / "credentials.env").read_text(encoding="utf-8")
+    assert "test-key-value" in stored
+    assert not (tmp_path / ".env").exists(), "global login must not touch the project"
+    assert not (tmp_path / "config.yaml").exists(), "credential must not reach config.yaml"
+
+
+def test_login_to_project_scope_writes_the_project_env(tmp_path, monkeypatch):
+    """--scope project keeps the key beside the code, in the gitignored .env."""
+    monkeypatch.chdir(tmp_path)
+    result = run("providers", "login", "-p", "groq", "--api-key", "test-key-value",
+                 "--scope", "project")
+    assert result.exit_code == 0
     assert "test-key-value" in (tmp_path / ".env").read_text(encoding="utf-8")
     assert not (tmp_path / "config.yaml").exists(), "credential must not reach config.yaml"
+    global_env = Path.home() / ".terminus" / "credentials.env"
+    assert not global_env.exists(), "project scope must not write the global store"
+
+
+def test_project_env_wins_over_global_credentials(tmp_path, monkeypatch):
+    """A repository that pins its own key must get that key, not the user's."""
+    monkeypatch.chdir(tmp_path)
+    run("providers", "login", "-p", "groq", "--api-key", "global-key")
+    (tmp_path / ".env").write_text("GROQ_API_KEY=project-key\n", encoding="utf-8")
+
+    from terminus.user_config import credential_source, load_env_files
+
+    load_env_files()  # what every real entry point does before resolving a key
+    assert credential_source("GROQ_API_KEY") == "project .env"
 
 
 def test_login_replaces_an_existing_key_rather_than_appending(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    run("providers", "login", "-p", "groq", "--api-key", "first")
-    run("providers", "login", "-p", "groq", "--api-key", "second")
+    run("providers", "login", "-p", "groq", "--api-key", "first", "--scope", "project")
+    run("providers", "login", "-p", "groq", "--api-key", "second", "--scope", "project")
     lines = [ln for ln in (tmp_path / ".env").read_text(encoding="utf-8").splitlines()
              if ln.startswith("GROQ_API_KEY=")]
     assert lines == ["GROQ_API_KEY=second"]
@@ -318,7 +350,8 @@ def test_login_replaces_an_existing_key_rather_than_appending(tmp_path, monkeypa
 
 def test_login_prompts_without_echoing(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    result = run("providers", "login", "-p", "cohere", input="prompted-secret\n")
+    result = run("providers", "login", "-p", "cohere", "--scope", "project",
+                 input="prompted-secret\n")
     assert result.exit_code == 0
     assert "prompted-secret" in (tmp_path / ".env").read_text(encoding="utf-8")
     assert "prompted-secret" not in result.output, "a prompted secret must not be echoed back"
@@ -326,7 +359,7 @@ def test_login_prompts_without_echoing(tmp_path, monkeypatch):
 
 def test_logout_removes_the_key(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    run("providers", "login", "-p", "groq", "--api-key", "to-remove")
+    run("providers", "login", "-p", "groq", "--api-key", "to-remove", "--scope", "project")
     result = run("providers", "logout", "-p", "groq")
     assert result.exit_code == 0
     assert "to-remove" not in (tmp_path / ".env").read_text(encoding="utf-8")
@@ -545,7 +578,340 @@ def test_credential_status_never_returns_values():
         assert set(entry) == {"name", "configured", "source"}
         assert isinstance(entry["configured"], bool)
 
+# --- terminal rendering -----------------------------------------------------
+#
+# A mistyped rich markup tag does not fail where it is written. It fails when
+# that string is finally rendered, which for the session header means the whole
+# REPL dies on its first frame with a MarkupError traceback and a stack of
+# rich internals the user cannot act on. So the user-facing strings are rendered
+# here instead.
+#
+# Rendered through ``Console.print`` rather than ``Text.from_markup`` on
+# purpose: those two differ in strictness, and the console is what the CLI
+# actually uses. ``[/bold cyan]`` is tolerated by the console and rejected by
+# ``from_markup``, so testing the stricter one would report failures that the
+# user would never see.
 
-def test_mask_hides_a_value():
-    assert settings.mask("secret") == "********"
-    assert settings.mask("") == ""
+_UI_MODULES = (
+    "src/terminus/cli_app/repl.py",
+    "src/terminus/cli_app/main.py",
+    "src/terminus/cli_app/formatting.py",
+)
+
+
+def _string_literals(path):
+    """Plain (non-interpolated) string literals in *path*.
+
+    Two filters, both necessary:
+
+    * **Joined across implicit concatenation.** The case that actually happened
+      was a tag opening in one fragment and closing in the next - balanced in
+      either fragment alone, broken together.
+    * **Interpolated strings excluded.** For an f-string the literal in the
+      source is not what renders: ``f"[bold green]{x}[/bold green]"`` is printed
+      with *x* substituted, and the opening tag ends up in the middle of the
+      output. Rendering the raw literal tests something the user never sees. The
+      f-string call sites are covered by the header/heading render tests below.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path(__file__).resolve().parents[1] / path
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+
+    # ast gives no parent links, so record them: the f-string filter below is the
+    # only way to tell an interpolated literal from a plain one.
+    parent = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
+
+    plain = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        # A JoinedStr is the f-string; its literal parts are direct children of
+        # it, so those parts are not what gets rendered.
+        if isinstance(parent.get(node), ast.JoinedStr):
+            continue
+        plain.append((node.lineno, node.value))
+    return plain
+
+
+@pytest.mark.parametrize("module", _UI_MODULES)
+def test_every_literal_markup_string_renders(module):
+    from rich.console import Console
+
+    console = Console(width=120, force_terminal=False)
+    broken = []
+    for lineno, text in _string_literals(module):
+        if "[" not in text:
+            continue
+        try:
+            console.print(text)
+        except Exception as exc:
+            broken.append(f"{module}:{lineno} {type(exc).__name__}: {exc}")
+    assert not broken, "unbalanced rich markup: " + "; ".join(broken)
+
+
+@pytest.mark.parametrize("module", _UI_MODULES)
+def test_every_module_parses(module):
+    import ast
+    import pathlib
+
+    source = pathlib.Path(__file__).resolve().parents[1] / module
+    ast.parse(source.read_text(encoding="utf-8"))
+
+
+
+def test_session_header_renders(tmp_path, monkeypatch):
+    """The header is the first thing every session prints, so it must render."""
+    from rich.console import Console
+    from rich.panel import Panel
+
+    from terminus.cli_app.repl import _short_cwd, _version
+
+    monkeypatch.chdir(tmp_path)
+    console = Console(width=100, force_terminal=False)
+    console.print(
+        Panel(
+            f"[bold]{_short_cwd()}[/bold]\n"
+            f"[dim]Type[/dim] [cyan]/help[/cyan] [dim]for commands, "
+            f"[cyan]/exit[/cyan] [dim]to quit, or just ask a question.[/dim]",
+            title=f"[bold blue]Terminus[/bold blue] {_version()}",
+            subtitle="[dim]coding agent[/dim]",
+            border_style="blue",
+            padding=(0, 2),
+        )
+    )
+    assert _version()
+
+
+def test_short_cwd_is_shortened_and_never_raises():
+    from pathlib import Path
+
+    from terminus.cli_app.repl import _short_cwd
+
+    shown = _short_cwd()
+    assert shown
+    assert "\n" not in shown
+    # Either the home prefix was elided, or we are not under home at all.
+    assert shown.startswith("~") or shown == str(Path.cwd())
+
+
+def test_default_log_level_does_not_flood_the_terminal():
+    """INFO by default means the answer arrives behind a request log.
+
+    At INFO, ``httpx`` narrates every provider request as its own line, and a
+    single model download produces forty of them. WARNING is the default and
+    ``--log-level`` is how you ask for more.
+    """
+    from typer.testing import CliRunner
+
+    result = CliRunner().invoke(app, ["--help"])
+    assert result.exit_code == 0
+    help_text = " ".join(result.output.split())
+    assert "WARNING" in help_text
+    assert "--log-level" in help_text
+
+
+def test_third_party_loggers_stay_quiet_unless_debug():
+    """Third-party WARNINGs must not reach the user.
+
+    A library warning is a condition the user cannot act on and that Terminus
+    already reports through its own error path. LangSmith warns once per trace
+    when the account's monthly quota is spent, which was flooding stderr in the
+    middle of an answer.
+    """
+    import logging
+
+    from terminus.observability.logging import set_log_level
+
+    try:
+        for level in ("WARNING", "ERROR", "INFO"):
+            set_log_level(level)
+            assert logging.getLogger("httpx").level == logging.ERROR, (
+                f"httpx speaks at {level}"
+            )
+            assert logging.getLogger("langsmith.client").level == logging.ERROR, (
+                f"langsmith speaks at {level}"
+            )
+        set_log_level("DEBUG")
+        assert logging.getLogger("httpx").level == logging.DEBUG
+        assert logging.getLogger("langsmith.client").level == logging.DEBUG
+    finally:
+        set_log_level("WARNING")
+
+
+
+def test_terminus_loggers_follow_the_requested_level():
+    import logging
+
+    from terminus.observability.logging import set_log_level
+
+    try:
+        set_log_level("DEBUG")
+        assert logging.getLogger("terminus").level == logging.DEBUG
+        # A child logger is left at NOTSET and inherits, which is the whole
+        # point of not pinning a level per module. getEffectiveLevel() is what
+        # the logging machinery actually consults.
+        child = logging.getLogger("terminus.cli")
+        assert child.level == logging.NOTSET
+        assert child.getEffectiveLevel() == logging.DEBUG
+        set_log_level("ERROR")
+        assert child.getEffectiveLevel() == logging.ERROR
+    finally:
+        set_log_level("WARNING")
+
+
+
+def test_unknown_log_level_falls_back_to_warning():
+    import logging
+
+    from terminus.observability.logging import set_log_level
+
+    try:
+        set_log_level("NOT_A_LEVEL")
+        assert logging.getLogger("terminus").level == logging.WARNING
+    finally:
+        set_log_level("WARNING")
+
+
+# --- the agent prompt interface --------------------------------------------
+#
+# README, the top-level help and `terminus models set`'s own hint all tell the
+# user to write `terminus agent -p "..."`. That had no flag behind it: the
+# prompt was positional only, so the documented command failed with "No such
+# option: -p". These pin the two spellings to actually working, and pin the
+# conflict to being an error rather than a silent pick.
+
+def _agent_run(monkeypatch, args):
+    """Invoke `terminus agent ...` with the network and the model stubbed out.
+
+    Only the argument handling is under test, so handle_query is replaced and
+    the prompt it received is handed back for inspection.
+    """
+    import terminus.agent.orchestrator as orchestrator
+
+    seen = {}
+
+    async def fake_handle_query(question, thread_id=None, **kwargs):
+        seen["prompt"] = question
+        return "answered"
+
+    monkeypatch.setattr(orchestrator, "handle_query", fake_handle_query)
+    monkeypatch.setattr("terminus.cli.initialize", lambda: None)
+
+    result = CliRunner().invoke(app, args)
+    return result, seen
+
+
+def test_agent_prompt_flag_and_positional_agree(monkeypatch):
+    flagged, seen_flag = _agent_run(monkeypatch, ["agent", "-p", "where is retry logic?"])
+    assert flagged.exit_code == 0, flagged.output
+    assert seen_flag["prompt"] == "where is retry logic?"
+
+    positional, seen_pos = _agent_run(monkeypatch, ["agent", "where is retry logic?"])
+    assert positional.exit_code == 0, positional.output
+    assert seen_pos["prompt"] == seen_flag["prompt"]
+
+
+def test_agent_accepts_long_prompt_flag(monkeypatch):
+    result, seen = _agent_run(monkeypatch, ["agent", "--prompt", "hello there"])
+    assert result.exit_code == 0, result.output
+    assert seen["prompt"] == "hello there"
+
+
+def test_agent_rejects_prompt_given_twice(monkeypatch):
+    """Two spellings, two values. Picking one silently runs the wrong question."""
+    result, seen = _agent_run(monkeypatch, ["agent", "-p", "one", "two"])
+    assert result.exit_code == 2
+    # Reported as a usage error, not as a traceback. There is no
+    # `typer.UsageError`, so the obvious spelling raised AttributeError and the
+    # user saw a stack trace instead of the sentence.
+    reported = result.output + (getattr(result, "stderr", "") or "")
+    assert "not both" in reported
+    assert "Traceback" not in reported
+    assert "AttributeError" not in reported
+    assert seen == {}, "no run should have been started"
+
+
+def test_agent_option_without_a_prompt_is_a_usage_error(monkeypatch):
+    """--model with no prompt is a mistake worth explaining, not a crash."""
+    result, seen = _agent_run(monkeypatch, ["agent", "--model", "some-model"])
+    assert result.exit_code == 2
+    reported = result.output + (getattr(result, "stderr", "") or "")
+    assert "single prompt" in reported
+    assert "Traceback" not in reported
+    assert "AttributeError" not in reported
+    assert seen == {}
+
+
+
+def test_agent_help_documents_the_documented_syntax():
+    """The README and the top-level help both promise `-p`; it must be listed."""
+    result = CliRunner().invoke(app, ["agent", "--help"])
+    assert result.exit_code == 0
+    assert "-p" in result.output
+    assert "--prompt" in result.output
+
+
+# --- LangSmith tracing is opt-in -------------------------------------------
+
+def test_tracing_is_off_by_default():
+    from terminus.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["observability"]["tracing"] is False
+
+
+def test_configure_tracing_disables_it_despite_the_env_file(monkeypatch):
+    """A key left in .env must not be enough to start exporting prompts."""
+    from terminus.config import CONFIG
+    from terminus.observability.logging import configure_tracing
+
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.setenv("LANGCHAIN_TRACING_V2", "true")
+    monkeypatch.setitem(CONFIG["observability"], "tracing", False)
+
+    assert configure_tracing() is False
+    for name in ("LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING"):
+        assert name not in os.environ, f"{name} still set; LangChain would trace"
+
+
+def test_configure_tracing_can_be_enabled_deliberately(monkeypatch):
+    from terminus.config import CONFIG
+    from terminus.observability.logging import configure_tracing
+
+    monkeypatch.setenv("LANGSMITH_API_KEY", "not-a-real-key")
+    monkeypatch.setitem(CONFIG["observability"], "tracing", True)
+
+    assert configure_tracing() is True
+    assert os.environ.get("LANGSMITH_TRACING") == "true"
+    # The key is left alone, so enabling is only ever about the switch.
+    assert os.environ.get("LANGSMITH_API_KEY") == "not-a-real-key"
+
+
+def test_configure_tracing_keeps_the_api_key_when_disabling(monkeypatch):
+    from terminus.config import CONFIG
+    from terminus.observability.logging import configure_tracing
+
+    monkeypatch.setenv("LANGSMITH_API_KEY", "not-a-real-key")
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.setitem(CONFIG["observability"], "tracing", False)
+
+    configure_tracing()
+    assert os.environ.get("LANGSMITH_API_KEY") == "not-a-real-key"
+
+
+def test_initialize_applies_the_tracing_switch(monkeypatch):
+    """The switch has to be applied by the startup path, not merely exist."""
+    import terminus.cli as cli
+
+    monkeypatch.setattr(cli, "load_project_env", lambda path: None)
+    monkeypatch.setitem(CONFIG["observability"], "tracing", False)
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.setitem(CONFIG["vector_store"], "provider", "chromadb")
+    monkeypatch.setitem(CONFIG["rag"], "mode", "semantic")
+
+    cli.initialize()
+    assert "LANGSMITH_TRACING" not in os.environ

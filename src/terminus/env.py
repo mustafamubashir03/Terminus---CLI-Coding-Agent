@@ -20,8 +20,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
-
 
 def find_project_env(start_path: str | Path | None = None) -> Path | None:
     start = Path(start_path or Path.cwd()).resolve()
@@ -40,7 +38,13 @@ def find_project_env(start_path: str | Path | None = None) -> Path | None:
 
 
 def load_project_env(start_path: str | Path | None = None) -> Path | None:
-    env_file = find_project_env(start_path)
-    if env_file is not None:
-        load_dotenv(env_file, override=False)
-    return env_file
+    """Load credentials for this process, and return the project file if there was one.
+
+    Kept as the single entry point everything already calls, so adding the global
+    credential store did not mean hunting down call sites. The returned path is
+    still the project ``.env`` because that is what callers report on;
+    ``user_config.load_env_files`` returns the full set.
+    """
+    from terminus.user_config import load_env_files
+
+    return load_env_files(start_path).get("project")

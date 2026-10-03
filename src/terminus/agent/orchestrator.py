@@ -1,38 +1,98 @@
-"""Running one /ask turn: stream the answer, and own the turn's permissions.
+"""Running one agent turn: run the loop, decide how it ended, return the answer.
 
-The whole conversational path is here. ``handle_query`` builds the agent, installs
-the turn's execution scope, streams the graph, and returns the final text.
+`handle_query` is the whole conversational path. It builds a policy, hands it to
+`build_agent`, streams the graph inside an execution scope, and turns what came
+back into a `TurnResult`.
 
-Two details worth knowing before changing it.
+Three things worth knowing before changing it.
 
 **It owns terminal output.** The answer is streamed to stdout as the model
-produces it, so callers must not also print the returned string. It prints to the
-stream and returns the same text, because a caller that wants the answer in a
-variable and a user who wants to watch it arrive are both reasonable.
+produces it, so callers must not also print the returned string.
 
-**The stream is consumed twice over.** ``messages`` yields per-token deltas for
-live output; ``values`` yields graph state so the final answer can be located.
-The first is a presentation concern and the second is the source of truth, which
-is why a non-streaming provider still produces an answer - it just arrives all
-at once.
+**The stream is consumed twice over.** `messages` yields per-token deltas for
+live output; `values` yields graph state so the final answer can be located. The
+first is presentation, the second is the source of truth - which is why a
+non-streaming provider still produces an answer, just all at once.
 
-Message history is not assembled here. The checkpointer replays the thread on the
-next call for the same id, which is what carries the conversation between turns.
+**Message history is not assembled here.** The checkpointer replays the thread on
+the next call for the same id, which is what carries the conversation between
+turns.
+
+The loop itself belongs to LangGraph. This module decides when to stop caring
+about it: what counts as an answer, what counts as a failure, and what happens
+when the model wants to claim success it has not observed.
 """
 
 import sys
+from dataclasses import dataclass
+from enum import Enum
 
-from terminus.agent.factory import ask_permission_policy, build_agent
+from terminus.agent.factory import ask_policy, build_agent
+from terminus.agent.observation import observation_pending
 from terminus.execution import ask_context, execution_scope
-from terminus.llm.factory import get_llm
 from terminus.llm.text import message_text
 from terminus.observability.logging import get_logger
-from terminus.observability.usage_tracker import UsageCallbackHandler, record
+from terminus.observability.usage_tracker import (
+    ToolCallbackHandler,
+    UsageCallbackHandler,
+    record,
+)
 
 logger = get_logger(__name__)
 
-_AI_MSG_NAME = "AIMessage"
 _MODEL_NODE = "model"
+
+_LIMIT_NOTICE = "Model call limits exceeded:"
+"""Prefix of the notice ``ModelCallLimitMiddleware`` appends when it ends a run.
+
+With ``exit_behavior="end"`` the framework writes this as the turn's last AI
+message rather than raising, so it arrives looking exactly like an answer. Left
+alone it would be reported as a completed turn whose answer is a budget warning.
+Matched on its prefix because that string is what the user is shown, and it is
+the only signal the middleware gives - there is no state key to read instead.
+"""
+
+# Tools whose result means the agent has looked at the effect of its own work,
+# and the tools that mean something changed, are defined once in
+# ``agent.observation`` and enforced by the middleware inside the graph. This
+# module only reports what the graph already decided.
+
+
+class Outcome(str, Enum):
+    """How a turn ended."""
+
+    DONE = "done"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class TurnResult:
+    """What one turn produced, and how it ended."""
+
+    outcome: Outcome
+    text: str = ""
+    unverified: bool = False
+    """True when the agent claimed completion after changing files without
+    reading the result back or running anything."""
+    files_changed: tuple[str, ...] = ()
+    """Workspace-relative paths the turn's successful tool calls reported writing.
+
+    Observed, not asserted: it is derived from the tool calls LangGraph actually
+    executed, so it cannot claim a change that was refused or that never landed.
+    Workspace-relative because that is how the model and the user both refer to
+    these paths.
+    """
+    tool_failures: tuple[str, ...] = ()
+    """``name: error`` for tool calls that raised, including workspace refusals.
+
+    A tool that *returns* a refusal is not here - it ran, and its result was the
+    refusal. This is the list of calls the runtime rejected.
+    """
+
+    def __str__(self) -> str:
+        return self.text
 
 
 def _extract_text(msg) -> str:
@@ -43,7 +103,7 @@ def _stream_delta(msg) -> str:
     """Return the visible text one streamed chunk contributes.
 
     Deliberately does NOT strip: every chunk is a fragment of a single message,
-    so trimming would eat the spaces between words.  Non-text blocks (reasoning,
+    so trimming would eat the spaces between words. Non-text blocks (reasoning,
     tool-call payloads) are dropped so only the answer reaches the terminal.
     """
     content = getattr(msg, "content", "")
@@ -64,47 +124,64 @@ def _write(text: str) -> None:
     sys.stdout.flush()
 
 
-async def handle_query(question: str, thread_id: str | None = None,
-                       interactive: bool = True) -> str:
-    """Handle a single /ask query and return the final answer.
+def _budget_message(model_calls: int) -> str:
+    return (
+        f"Model call limit reached after {model_calls} calls, with no final "
+        "answer. Here is what was established so far, stated as observations rather "
+        "than conclusions."
+    )
 
-    The agent graph is consumed with two stream modes at once:
 
-    * ``messages`` – per-token deltas from the model node.  These are written to
-      stdout as they arrive, so the user sees the answer being produced.  Tool
-      output and middleware-internal calls (e.g. the summarizer's own model call)
-      are filtered out.
-    * ``values``  – the full graph state after each superstep, used exactly as
-      before to locate the last real answer.
+async def run_turn(
+    question: str,
+    thread_id: str | None = None,
+    *,
+    interactive: bool = True,
+    policy=None,
+    kind: str = "ask",
+    permission=None,
+) -> TurnResult:
+    """Run one agent turn and return what it produced.
 
-    ``messages`` is a superset trigger rather than a replacement: a provider that
-    does not stream simply yields one chunk per model call, and the ``values``
-    path still produces the answer, which is then printed in full.  This function
-    owns all terminal output, so callers must not print the returned string.
-
-    Message history is not assembled here.  The checkpointer wired in
-    ``agent/factory.build_agent`` stores the thread's messages and replays them
-    on the next call for the same ``thread_id``, which is what carries the
-    conversation between questions.
-
-    This function owns the permission policy for the turn: it wraps the whole
-    stream in an execution scope, so the tools see /ask's authority and nothing
-    else. A /plan worker running elsewhere in the process cannot change it.
+    ``policy`` defaults to the /ask policy. ``permission`` defaults to the /ask
+    permission policy. Both exist so this is the single execution path for every
+    kind of agent rather than one per surface.
     """
-    logger.info("Handling query: %s", question)
-    agent = await build_agent()
-    context = ask_context(ask_permission_policy(interactive))
+    from terminus.agent.factory import ask_permission_policy
+
+    agent = await build_agent(policy or ask_policy())
+    context = permission or ask_context(ask_permission_policy(interactive))
     agent_config = {"configurable": {"thread_id": thread_id}}
+    handler = UsageCallbackHandler(kind=kind)
+    # Tool observation, on the same config as usage. The framework's on_tool_*
+    # hooks fire for every call ToolNode makes, so this sees the run without a
+    # second execution path - and it sees failures, which reading AIMessage
+    # .tool_calls afterwards cannot.
+    tools_seen = ToolCallbackHandler(kind=kind)
+    model_calls = 0
+
     best: str | None = None
     history: list = []
-    handler = UsageCallbackHandler(kind="ask")
-
     printed = False
     model_call: str | None = None
     model_call_text = ""
+    step_unverified = False
+    limit_notice = ""
 
-    def _flush_turn() -> None:
-        """Close off the current model call's output, if it produced any."""
+    def finish(outcome: Outcome, text: str) -> TurnResult:
+        """Wrap up one turn: publish usage, publish tool activity, shape the result."""
+        record(handler.records, kind)
+        return TurnResult(
+            outcome,
+            text=text,
+            unverified=step_unverified,
+            files_changed=tuple(tools_seen.files_changed()),
+            tool_failures=tuple(
+                f"{r.name}: {r.error}" for r in tools_seen.failures()
+            ),
+        )
+
+    def flush_turn() -> None:
         nonlocal printed
         if model_call_text:
             _write("\n")
@@ -114,7 +191,7 @@ async def handle_query(question: str, thread_id: str | None = None,
         with execution_scope(context):
             async for mode, step in agent.astream(
                 {"messages": [{"role": "user", "content": question}]},
-                config={**agent_config, "callbacks": [handler]},
+                config={**agent_config, "callbacks": [handler, tools_seen]},
                 stream_mode=["values", "messages"],
             ):
                 if mode == "messages":
@@ -122,12 +199,16 @@ async def handle_query(question: str, thread_id: str | None = None,
                     meta = meta or {}
                     if meta.get("langgraph_node") != _MODEL_NODE:
                         continue
-                    # checkpoint_ns is unique per model call, so a change means the
-                    # previous call ended.  This keeps multi-turn tool loops and a
-                    # provider fallback retry from being printed as one run-on.
+                    # checkpoint_ns is unique per model call, so a change means
+                    # the previous call ended. This keeps multi-turn tool loops
+                    # and a provider fallback retry from printing as one run-on,
+                    # and it is also where a *call* is counted - a streamed chunk
+                    # is not a call, so the budget message must not count them.
                     call_id = meta.get("checkpoint_ns")
                     if call_id != model_call:
-                        _flush_turn()
+                        flush_turn()
+                        if model_call is not None:
+                            model_calls += 1
                         model_call = call_id
                         model_call_text = ""
                     delta = _stream_delta(chunk)
@@ -136,64 +217,76 @@ async def handle_query(question: str, thread_id: str | None = None,
                         model_call_text += delta
                     continue
 
-                msgs = step.get("messages") or []
-                history = msgs
-                for msg in reversed(msgs):
-                    if type(msg).__name__ == _AI_MSG_NAME:
-                        content = _extract_text(msg)
-                        if content:
-                            best = content
-                            break
-    except Exception:
-        _flush_turn()
-        if best:
-            logger.warning(
-                "Agent stream failed after partial output; returning it",
-                exc_info=True,
-            )
-            record(handler.records, "ask")
-            return best
-        raise
+                history = step.get("messages") or []
 
-    _flush_turn()
-    record(handler.records, "ask")
+                for msg in reversed(history):
+                    if type(msg).__name__ != "AIMessage":
+                        continue
+                    if getattr(msg, "tool_calls", None):
+                        # Text alongside tool calls is the model narrating what it
+                        # is about to do, not an answer. Treating it as one would
+                        # report a turn that ran out of budget mid-tool-call as a
+                        # completed answer.
+                        continue
+                    content = _extract_text(msg)
+                    if content.startswith(_LIMIT_NOTICE):
+                        limit_notice = content
+                        continue
+                    if content:
+                        best = content
+                        break
+
+                # Read from the graph state the middleware writes, so this reports
+                # the rule that was actually enforced rather than a second copy of
+                # it. Sampled on every state update and read once at the end,
+                # because it describes how the turn *finished*: a model that
+                # claimed completion, was sent back, and then read its own work has
+                # verified it, even though the claim arrived a step earlier.
+                step_unverified = observation_pending(step)
+    except (KeyboardInterrupt, SystemExit):
+        flush_turn()
+        record(handler.records, kind)
+        raise
+    except Exception as exc:
+        flush_turn()
+        if best:
+            # Partial output is better than none, and the traceback belongs in
+            # the log: a user who sees a stack trace concludes the agent broke.
+            logger.warning(
+                "Agent stream failed after partial output; returning it: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return finish(Outcome.DONE, best)
+        logger.error("Agent turn failed: %s: %s", type(exc).__name__, exc)
+        return finish(Outcome.FAILED, f"Query failed: {exc}")
+
+    flush_turn()
+
+    if limit_notice:
+        # The framework's own words for it, kept rather than replaced.
+        return finish(Outcome.BUDGET_EXHAUSTED, limit_notice)
 
     if best:
         if not printed:
-            # Nothing was streamed (non-streaming provider): show it now.
             _write(best + "\n")
-        return best
+        return finish(Outcome.DONE, best)
 
-    # No final text answer emitted (tool loop without a closing message).
-    # Force an answer from the context the agent already gathered.
-    if len(history) > 1:
-        try:
-            llm = get_llm()
-            forced = await llm.ainvoke([
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a code assistant. Based strictly on the tool "
-                        "results in the conversation below, answer the user's "
-                        "original question with a final, concise text answer. "
-                        "Do NOT call any tools."
-                    ),
-                },
-                *history[-14:],
-                {
-                    "role": "user",
-                    "content": "Now produce your final text answer to the original question.",
-                },
-            ])
-            content = _extract_text(forced)
-            if content:
-                logger.info("Agent ended without text; forced final answer from context")
-                _write(content + "\n")
-                return content
-        except Exception:
-            logger.warning(
-                "Forced final-answer fallback failed",
-                exc_info=True,
-            )
+    # No final text. Either the budget ended the graph mid-loop or the model
+    # produced nothing usable. Both are reported as what they are rather than
+    # dressed up as a completed answer.
+    if history:
+        return finish(Outcome.BUDGET_EXHAUSTED, _budget_message(model_calls))
+    return finish(Outcome.FAILED, "The agent produced no answer.")
 
-    raise ValueError("Agent produced no answer")
+
+async def handle_query(question: str, thread_id: str | None = None,
+                       interactive: bool = True) -> str:
+    """Run one /ask turn and return its answer text.
+
+    Owns the permission policy for the turn: the whole stream runs inside an
+    execution scope, so the tools see /ask's authority and nothing else.
+    """
+    logger.info("Handling query: %s", question)
+    result = await run_turn(question, thread_id, interactive=interactive)
+    return str(result)

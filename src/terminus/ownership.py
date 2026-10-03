@@ -125,10 +125,6 @@ class OwnerInfo:
     since: float
 
 
-# ---------------------------------------------------------------------------
-# The OS lock, isolated behind one function
-# ---------------------------------------------------------------------------
-
 # The lock and the record live in two files on purpose.
 #
 # On Windows a byte-range lock is enforced by the kernel against *reads* as well
@@ -201,8 +197,6 @@ class ProjectOwnership:
             _close_quietly(handle)
             if exc.errno in _CONTENTION_ERRNOS:
                 raise OwnershipConflict(self.project_id, holder) from None
-            # A real I/O fault must not be reported as "someone else owns it":
-            # that would disguise a broken database as a busy project.
             raise
 
         owner = OwnerInfo(

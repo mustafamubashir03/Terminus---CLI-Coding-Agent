@@ -23,21 +23,17 @@ from terminus.observability.logging import get_logger
 
 logger = get_logger(__name__)
 
-_HASH_CHUNK = 65536  # 64 KB read chunks for streaming SHA-256
+_HASH_CHUNK = 65536
 
-
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
 
 @dataclass
 class FileSnapshot:
     """Fingerprint of a single source file at a point in time."""
     path: str
-    content_hash: str  # "sha256:<hex>"
+    content_hash: str
     mtime: float
     size: int
-    indexed_at: str  # ISO-8601 UTC
+    indexed_at: str
 
 
 @dataclass
@@ -52,10 +48,6 @@ class DiffResult:
     def has_changes(self) -> bool:
         return bool(self.added or self.modified or self.deleted)
 
-
-# ---------------------------------------------------------------------------
-# Hashing helper
-# ---------------------------------------------------------------------------
 
 def compute_file_hash(filepath: str, max_size: int | None = None) -> str:
     """Return ``sha256:<hex>`` for *filepath*, reading in streaming chunks.
@@ -78,10 +70,6 @@ def compute_file_hash(filepath: str, max_size: int | None = None) -> str:
     return f"sha256:{h.hexdigest()}"
 
 
-# ---------------------------------------------------------------------------
-# Fast stat helper (mtime + size only, no hash)
-# ---------------------------------------------------------------------------
-
 def _fast_stat(filepath: str) -> tuple[float, int] | None:
     """Return ``(mtime, size)`` or ``None`` if stat fails."""
     try:
@@ -90,10 +78,6 @@ def _fast_stat(filepath: str) -> tuple[float, int] | None:
     except OSError:
         return None
 
-
-# ---------------------------------------------------------------------------
-# Manifest
-# ---------------------------------------------------------------------------
 
 _DEFAULT_MANIFEST = ".terminus/index/manifest.json"
 
@@ -123,8 +107,6 @@ class Manifest:
         self.repo_path = repo_path
         self.files: dict[str, FileSnapshot] = files or {}
         self.last_full_index = last_full_index
-
-    # -- Persistence --------------------------------------------------------
 
     @staticmethod
     def load(repo_path: str) -> Manifest:
@@ -169,12 +151,9 @@ class Manifest:
             logger.debug(f"Manifest saved ({len(self.files)} files) → {path}")
         except Exception as exc:
             logger.error(f"Failed to save manifest: {exc}")
-            # Clean up partial write
             if tmp.exists():
                 tmp.unlink(missing_ok=True)
             raise
-
-    # -- Snapshot & diff ----------------------------------------------------
 
     @staticmethod
     def snapshot_directory(
@@ -230,7 +209,7 @@ class Manifest:
             mtime, size = stat
             snapshots[filepath] = FileSnapshot(
                 path=filepath,
-                content_hash="",  # not computed yet
+                content_hash="",
                 mtime=mtime,
                 size=size,
                 indexed_at=now,
@@ -254,7 +233,6 @@ class Manifest:
         prev_paths = set(self.files.keys())
         curr_paths = set(current.keys())
 
-        # -- New files (in current but not in manifest) ---------------------
         # They will be indexed, so record a real content hash too.
         for path in sorted(curr_paths - prev_paths):
             snap = current[path]
@@ -265,18 +243,14 @@ class Manifest:
                 snap.content_hash = "hash_error"
             result.added.append(path)
 
-        # -- Deleted files (in manifest but not in current) -----------------
         for path in sorted(prev_paths - curr_paths):
             result.deleted.append(path)
 
-        # -- Possibly modified files (in both) ------------------------------
         for path in sorted(curr_paths & prev_paths):
             old = self.files[path]
             new = current[path]
 
-            # Fast stat check
             if old.mtime == new.mtime and old.size == new.size:
-                # Stat unchanged → file is definitely unchanged
                 if old.content_hash:
                     result.unchanged.append(path)
                 else:
@@ -285,7 +259,6 @@ class Manifest:
                     result.unchanged.append(path)
                 continue
 
-            # Stat changed → compute content hash to confirm
             try:
                 new.content_hash = compute_file_hash(path, max_size=max_size)
             except Exception as exc:
@@ -293,7 +266,6 @@ class Manifest:
                 new.content_hash = "hash_error"
 
             if old.content_hash and old.content_hash == new.content_hash:
-                # Content identical, only metadata changed (e.g. touch)
                 result.unchanged.append(path)
             else:
                 result.modified.append(path)

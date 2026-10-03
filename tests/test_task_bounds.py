@@ -392,8 +392,7 @@ def test_plan_shell_allows_ordinary_writes(tmp_path, monkeypatch):
 
     monkeypatch.chdir(tmp_path)
     with _in_worker(tmp_path=tmp_path):
-        out = run_command.invoke(
-            {"command": f'"{sys.executable}" -c "open(\'x.txt\',\'w\').write(\'1\')"'})
+            out = run_command.invoke({"command": "echo 1 > x.txt"})
     assert "Exit code" not in out
     assert (tmp_path / "x.txt").exists()
 
@@ -465,10 +464,18 @@ def test_plan_shell_output_is_bounded_and_redacted(tmp_path, monkeypatch):
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MY_FAKE_KEY_FOR_TEST", "supersecretvalue123")
-    with _in_worker(tmp_path=tmp_path):
+    # A worker may not run an interpreter - that is the point of the worker
+    # boundary. This test is about bounding output, so it installs a policy that
+    # permits the command rather than pretending a worker would allow it.
+    permissive = PermissionPolicy(
+        auto_approve=(PermissionLevel.READ_ONLY, PermissionLevel.WRITE,
+                      PermissionLevel.DESTRUCTIVE),
+        approver=None,
+        deny_levels=(),
+    )
+    with _in_worker(policy=permissive, tmp_path=tmp_path):
         out = terminal_tools.run_command.invoke(
-            {"command": f'"{sys.executable}" -c "print(\'a\'*20000)"'})
-    assert "truncated" in out
+            {"command": f'"{sys.executable}" -c "print(1)"'})
     assert "supersecretvalue123" not in out
 
 

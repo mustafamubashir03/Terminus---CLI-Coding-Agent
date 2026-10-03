@@ -138,9 +138,12 @@ def test_a_scope_is_restored_even_when_the_body_raises(project):
     assert current_execution() is None
 
 
-def test_a_task_policy_cannot_leak_into_ask(project, tmp_path):
+def test_a_task_policy_cannot_leak_into_ask(project):
     """A worker's WRITE must not survive into a later /ask turn."""
-    worker_file = tmp_path / "worker.txt"
+    # Both files live inside the workspace: these assertions are about which
+    # permission policy is in force, and a path outside the workspace would be
+    # refused for containment before the policy was ever consulted.
+    worker_file = project / "worker.txt"
     with execution_scope(task_context("t", "p", project, LENIENT)):
         assert write_file.invoke(
             {"file_path": str(worker_file), "content": "x"}
@@ -148,14 +151,14 @@ def test_a_task_policy_cannot_leak_into_ask(project, tmp_path):
 
     # a non-interactive /ask turn
     with execution_scope(ask_ctx(STRICT)):
-        ask_file = tmp_path / "ask.txt"
+        ask_file = project / "ask.txt"
         assert write_file.invoke(
             {"file_path": str(ask_file), "content": "x"}
         ).startswith("Refused:")
     assert not ask_file.exists()
 
 
-def test_a_worker_cannot_change_ask_permissions(project, tmp_path):
+def test_a_worker_cannot_change_ask_permissions(project):
     """The failure this step exists to fix: last-writer-wins on a global."""
     order = []
 
@@ -170,8 +173,8 @@ def test_a_worker_cannot_change_ask_permissions(project, tmp_path):
             order.append(("worker", write_file.invoke(
                 {"file_path": str(path), "content": "x"})))
 
-    ask_file = tmp_path / "ask.txt"
-    worker_file = tmp_path / "worker.txt"
+    ask_file = project / "ask.txt"
+    worker_file = project / "worker.txt"
 
     async def main():
         return await asyncio.gather(ask_turn(ask_file), worker_turn(worker_file))
@@ -185,13 +188,13 @@ def test_a_worker_cannot_change_ask_permissions(project, tmp_path):
     assert worker_file.exists()
 
 
-def test_concurrent_workers_keep_their_own_policies(project, tmp_path):
+def test_concurrent_workers_keep_their_own_policies(project):
     """Bounded fan-out is safe on the permission axis."""
     async def worker(name, policy):
         with execution_scope(task_context(name, "p", project, policy)):
             await asyncio.sleep(0)              # interleave
             out = write_file.invoke(
-                {"file_path": str(tmp_path / f"{name}.txt"), "content": "x"})
+                {"file_path": str(project / f"{name}.txt"), "content": "x"})
             return name, out
 
     async def main():
@@ -203,8 +206,8 @@ def test_concurrent_workers_keep_their_own_policies(project, tmp_path):
     results = dict(asyncio.run(main()))
     assert results["lenient"].startswith("File written")
     assert results["strict"].startswith("Refused:")
-    assert (tmp_path / "lenient.txt").exists()
-    assert not (tmp_path / "strict.txt").exists()
+    assert (project / "lenient.txt").exists()
+    assert not (project / "strict.txt").exists()
 
 
 def test_destructive_is_denied_for_a_worker_who_cannot_ask(project):
@@ -398,20 +401,21 @@ def test_the_worker_never_receives_a_checkpointer(project, monkeypatch):
             yield {"messages": [
                 {"role": "assistant", "content": "done", "type": "ai"}]}
 
-    def fake_create_agent(llm, tools, system_prompt, middleware=None,
-                          checkpointer=None, **kw):
-        seen["checkpointer"] = checkpointer
-        seen["thread"] = "thread_id" in str(kw)
+    async def fake_create_agent(policy):
+        seen["checkpointer"] = policy.checkpoint
+        seen["thread"] = policy.checkpoint
         return FakeAgent()
 
-    monkeypatch.setattr(ex, "create_agent", fake_create_agent)
+    monkeypatch.setattr(ex, "build_agent", fake_create_agent)
     monkeypatch.setattr(ex, "_tool_plans", _stub_tools)
     monkeypatch.setattr(ex, "get_chat_model", lambda *a, **k: "LLM")
     monkeypatch.setattr(ex, "build_skills_prompt", lambda: "")
     monkeypatch.setattr(ex, "judge_task", _passing_judge)
 
     asyncio.run(execute_task(_task(), workspace=project, attempt=1))
-    assert seen["checkpointer"] is None
+    # A worker is one bounded attempt, not a conversation: it must ask for no
+    # checkpoint, or it would accumulate a thread nobody ever reads.
+    assert seen["checkpointer"] is False
     assert "thread_id" not in str(seen["config"])
 
 

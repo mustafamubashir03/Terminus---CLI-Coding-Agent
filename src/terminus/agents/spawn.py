@@ -38,8 +38,6 @@ from terminus.tasks.errors import FailureInfo, classify_failure
 
 logger = get_logger(__name__)
 
-# --- bounds ----------------------------------------------------------------
-
 MAX_CHILD_AGENTS = MAX_CHILDREN_PER_PARENT
 """How many children one parent turn may spawn, in total.
 
@@ -111,15 +109,6 @@ class AgentResult:
     provider: str = ""
     duration_seconds: float = 0.0
     write_scope: str = ""
-    verification: str = "not_required"
-    """What verification, if any, the child itself established.
-
-    Deliberately not a boolean. A child that ran the tests and saw them pass has
-    done something a child that only read code has not, and the parent needs to
-    tell those apart. ``not_required`` covers research and review, where there is
-    nothing to execute. A child's success is never ``verified`` on the parent's
-    behalf: the parent owns that decision.
-    """
 
     @property
     def ok(self) -> bool:
@@ -141,7 +130,6 @@ class AgentResult:
             "provider": self.provider,
             "duration_seconds": round(self.duration_seconds, 2),
             "write_scope": self.write_scope,
-            "verification": self.verification,
         }
 
     def to_report(self) -> str:
@@ -159,9 +147,6 @@ class AgentResult:
         if self.tests_run:
             lines.append(f"  tests run: {', '.join(self.tests_run)}")
         return "\n".join(lines)
-
-
-# --- write ownership --------------------------------------------------------
 
 
 class WriteScopeError(RuntimeError):
@@ -257,9 +242,6 @@ def _reset_write_scopes() -> None:
     _write_scopes._holders.clear()
 
 
-# --- permission policy ------------------------------------------------------
-
-
 def child_policy(role: AgentRole) -> PermissionPolicy:
     """The policy a child runs under.
 
@@ -284,9 +266,6 @@ def child_policy(role: AgentRole) -> PermissionPolicy:
         approver=None,
         deny_levels=(PermissionLevel.WRITE, PermissionLevel.DESTRUCTIVE),
     )
-
-
-# --- context ----------------------------------------------------------------
 
 
 def build_child_context(
@@ -320,9 +299,6 @@ def build_child_context(
     if len(text) > MAX_CONTEXT_CHARS:
         text = text[: MAX_CONTEXT_CHARS - 32].rstrip() + "\n\n[context truncated]"
     return text
-
-
-# --- the child --------------------------------------------------------------
 
 
 @dataclass
@@ -399,8 +375,6 @@ class ChildAgent:
         self.project_facts = project_facts
         self._runner = runner
         self._owns_scope = False
-
-    # -- lifecycle ---------------------------------------------------------
 
     def claim_scope(self) -> None:
         if not self.role.write:
@@ -563,19 +537,29 @@ async def _default_runner(child: ChildAgent) -> Any:
       the duration, so a read-only child cannot write even if its prompt asks it
       to, and it cannot affect the parent's permissions on return.
     """
-    from terminus.agent.factory import build_agent
+    from terminus.agent.factory import build_agent, child_policy
     from terminus.execution import CHILD, ExecutionContext, execution_scope
-    from terminus.observability.usage_tracker import UsageCallbackHandler, record
+    from terminus.observability.usage_tracker import (
+        ToolCallbackHandler,
+        UsageCallbackHandler,
+        record,
+    )
     from terminus.workspace import project_root
 
     tools = _resolve_tools(child)
-    agent = await build_agent(
-        tools_override=tools,
+    agent = await build_agent(child_policy(
+        tools,
+        child.prompt(),
         model=child.spec.model,
         provider=child.spec.provider,
-        max_model_calls=child.role.max_model_calls,
-    )
+        model_call_limit=child.role.max_model_calls,
+        tool_call_limit=child.role.max_tool_calls,
+    ))
     handler = UsageCallbackHandler(kind=f"child_agent:{child.role.name}")
+    # A child's file writes are the parent's only evidence of what it did, and
+    # AgentResult.files_changed existed to carry exactly that and was never
+    # populated. The framework callbacks fill it from what actually ran.
+    tools_seen = ToolCallbackHandler(kind=f"child_agent:{child.role.name}")
     context = ExecutionContext(
         workspace=project_root(),
         kind=CHILD,
@@ -589,11 +573,20 @@ async def _default_runner(child: ChildAgent) -> Any:
                 {"messages": [{"role": "user", "content": child.prompt()}]},
                 config={
                     "configurable": {"thread_id": f"child-{child.agent_id}"},
-                    "callbacks": [handler],
+                    "callbacks": [handler, tools_seen],
                 },
             )
     finally:
         record(handler.records, kind=f"child_agent:{child.role.name}")
+        # Written onto the child's own result rather than a side table: the
+        # result is the thing the parent reads, and it already declared
+        # files_changed for exactly this and never had it filled in.
+        child.result.files_changed = list(tools_seen.files_changed())
+        for failure in tools_seen.failures():
+            logger.info(
+                "Child %s tool %s failed: %s",
+                child.agent_id, failure.name, failure.error,
+            )
 
     messages = result.get("messages") if isinstance(result, dict) else None
     if not messages:
@@ -620,9 +613,6 @@ def _resolve_tools(child: ChildAgent) -> list[Any]:
             ", ".join(child.rejected_tools),
         )
     return resolved
-
-
-# --- parent side ------------------------------------------------------------
 
 
 class AgentSpawner:
@@ -655,8 +645,6 @@ class AgentSpawner:
         self.children: list[ChildAgent] = []
         self.results: list[AgentResult] = []
         self._semaphore = asyncio.Semaphore(self.max_parallel)
-
-    # -- construction ------------------------------------------------------
 
     def resolve_skills(
         self, task: str, requested: Sequence[str] = (), **signals: Any
@@ -715,8 +703,6 @@ class AgentSpawner:
         )
         return child
 
-    # -- execution ---------------------------------------------------------
-
     async def run(self, child: ChildAgent) -> AgentResult:
         async with self._semaphore:
             result = await child.run()
@@ -763,8 +749,6 @@ class AgentSpawner:
         for child in self.children:
             child.cancel()
         _write_scopes.release_agent(self.parent_id)
-
-    # -- aggregation -------------------------------------------------------
 
     def aggregate(self) -> str:
         """Combine child results into one bounded report for the parent.

@@ -1,14 +1,23 @@
 import json
+from typing import ClassVar
 
 import httpx
 import pytest
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.outputs import (
+    ChatGeneration,
+    ChatGenerationChunk,
+    ChatResult,
+)
 from langchain_openai import ChatOpenAI
+from typer.testing import CliRunner
 
+from terminus.cli_app import app
+from terminus.llm._openrouter_model import OpenRouterChatModel
 from terminus.llm.fallback import FallbackChatModel
-from terminus.llm.factory import _OpenRouterChatModel
-from terminus.tasks.errors import ProviderCallError, classify_failure
+from terminus.tasks.errors import FailureInfo, ProviderCallError, classify_failure
 from terminus.tasks.executor import _verdict_from_text
 
 
@@ -106,7 +115,7 @@ def test_openrouter_preserves_reasoning_details_on_continuation():
         )
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    model = _OpenRouterChatModel(
+    model = OpenRouterChatModel(
         model="poolside/laguna-s-2.1:free",
         api_key="test",
         base_url="https://openrouter.ai/api/v1",
@@ -213,3 +222,170 @@ def test_text_verdict_parser_accepts_passed_and_rejects_negation():
     assert _verdict_from_text("The result is not passed.").passed is False
     assert _verdict_from_text("No verdict was returned") is None
 
+
+
+# --- streaming --------------------------------------------------------------
+#
+# FallbackChatModel had no _stream/_astream, so BaseChatModel.stream fell back to
+# _generate and emitted the whole answer as one chunk. `streaming: true` bought
+# nothing and the user saw the response appear in a single block at the end.
+
+class _Streamer(BaseChatModel):
+    """A model that honours the streaming contract, in pieces."""
+
+    PARTS: ClassVar[tuple[str, ...]] = ("Hello", " streamed", " world")
+
+    @property
+    def _llm_type(self) -> str:
+        return "test-streamer"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return ChatResult(
+            generations=[
+                ChatGeneration(message=AIMessage(content="".join(self.PARTS)))
+            ]
+        )
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+        for piece in self.PARTS:
+            yield ChatGenerationChunk(message=AIMessageChunk(content=piece))
+
+    async def _astream(self, messages, stop=None, run_manager=None, **kwargs):
+        for piece in self.PARTS:
+            yield ChatGenerationChunk(message=AIMessageChunk(content=piece))
+
+
+def _route():
+    from terminus.llm.fallback import FallbackChatModel, clear_reported_routes
+
+    clear_reported_routes()
+    return FallbackChatModel(
+        primary=_Streamer(), fallback=_Streamer(),
+        primary_provider="openrouter", primary_model="m1",
+        fallback_provider="groq", fallback_model="m2",
+        primary_attempts=1, backoff_seconds=0,
+    )
+
+
+def test_wrapper_streams_in_pieces_rather_than_one_block():
+    chunks = [c for c in _route().stream("hi") if c.content]
+    assert len(chunks) == len(_Streamer.PARTS), (
+        "the wrapper answered in one block; per-token streaming is broken"
+    )
+    assert "".join(c.content for c in chunks) == "".join(_Streamer.PARTS)
+
+
+def test_wrapper_streams_asynchronously_too():
+    import asyncio
+
+    async def collect():
+        return [c async for c in _route().astream("hi") if c.content]
+
+    chunks = asyncio.run(collect())
+    assert len(chunks) == len(_Streamer.PARTS)
+    assert "".join(c.content for c in chunks) == "".join(_Streamer.PARTS)
+
+
+def test_streamed_chunks_carry_the_route():
+    chunks = list(_route().stream("hi"))
+    meta = chunks[0].response_metadata
+    assert meta.get("terminus_provider") == "openrouter"
+    assert meta.get("terminus_model") == "m1"
+
+
+def test_invoke_is_unaffected_by_streaming():
+    result = _route().invoke("hi")
+    assert result.content == "".join(_Streamer.PARTS)
+
+
+def test_a_mid_stream_failure_does_not_switch_provider():
+    """Half an answer is already out; splicing in another provider is nonsense."""
+
+    class MidStreamBreak(_Streamer):
+        def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+            yield ChatGenerationChunk(message=AIMessageChunk(content="par"))
+            raise RuntimeError("connection dropped")
+
+    from terminus.llm.fallback import FallbackChatModel, clear_reported_routes
+
+    clear_reported_routes()
+    route = FallbackChatModel(
+        primary=MidStreamBreak(responses=[]), fallback=_Streamer(responses=[]),
+        primary_provider="openrouter", primary_model="m1",
+        fallback_provider="groq", fallback_model="m2",
+        primary_attempts=1, backoff_seconds=0,
+    )
+    emitted = []
+    with pytest.raises(Exception):
+        for chunk in route.stream("hi"):
+            emitted.append(chunk)
+    assert len(emitted) == 1, "should yield what it had, then propagate the error"
+
+
+# --- routing logs are not user-facing noise ---------------------------------
+
+def test_routing_decisions_are_reported_once_not_once_per_layer(caplog):
+    """Three nested fallback layers used to print the same line three times."""
+    import logging
+
+    from terminus.llm.fallback import clear_reported_routes
+
+    clear_reported_routes()
+    # One route for the whole loop: _route() resets the dedup set, so building a
+    # new one per iteration would defeat the thing under test.
+    route = _route()
+    with caplog.at_level(logging.INFO, logger="terminus.llm.fallback"):
+        for _ in range(3):
+            route._report_route_once(
+                "Answering from %s/%s instead of %s/%s", "groq", "m2", "openrouter", "m1"
+            )
+    matching = [r for r in caplog.records if "Answering from" in r.getMessage()]
+    assert len(matching) == 1, f"announced {len(matching)} times, expected once"
+
+
+def test_repeat_attempts_are_debug_not_warning(caplog):
+    """A route attempt failing is routing working, not a problem for the user."""
+    import logging
+
+    from terminus.llm.fallback import clear_reported_routes
+
+    clear_reported_routes()
+    with caplog.at_level(logging.DEBUG, logger="terminus.llm.fallback"):
+        _route()._log_primary_failure(
+            FailureInfo(message="429", category="rate_limit", status_code=429,
+                        retryable=True), 1
+        )
+    records = [r for r in caplog.records if "route attempt failed" in r.getMessage()]
+    assert records
+    assert all(r.levelno == logging.DEBUG for r in records), (
+        "per-attempt routing detail is back at WARNING and will flood the terminal"
+    )
+
+
+# --- dev mode ---------------------------------------------------------------
+
+def test_dev_flag_is_advertised():
+    result = CliRunner().invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "--dev" in result.output
+
+
+def test_dev_flag_on_agent_is_advertised():
+    result = CliRunner().invoke(app, ["agent", "--help"])
+    assert result.exit_code == 0
+    assert "--dev" in result.output
+
+
+def test_dev_turns_on_debug_logging(monkeypatch):
+    import logging
+
+    import terminus.observability.logging as logging_module
+
+    monkeypatch.setattr(logging_module, "configure_tracing", lambda: False)
+    try:
+        from typer.testing import CliRunner
+
+        CliRunner().invoke(app, ["agent", "--dev", "-p", "x", "--provider", "groq"])
+        assert logging.getLogger("terminus").level == logging.DEBUG
+    finally:
+        logging_module.set_log_level("WARNING")

@@ -39,12 +39,19 @@ logger = get_logger(__name__)
 
 BATCH_SIZE = 50
 
+SPARSE_VECTOR_NAME = "langchain-sparse"
 
-def _ensure_collection(client: Any, name: str) -> bool:
+
+def _ensure_collection(client: Any, name: str, *, sparse: bool) -> bool:
     """Create *name* if absent. True when the collection already had points.
 
     Returns whether the collection existed and was non-empty, which is the
     caller's signal to do an incremental reindex rather than a full one.
+
+    A sparse-capable collection is created with the ``langchain-sparse`` schema
+    from the start. Adding it later is not possible in Qdrant without recreating
+    the collection, so a dense-only collection that later needs hybrid retrieval
+    is permanently unusable.
     """
     from qdrant_client import models
 
@@ -54,13 +61,22 @@ def _ensure_collection(client: Any, name: str) -> bool:
         if (info.points_count or 0) > 0:
             return True
     if name not in existing:
-        client.create_collection(
-            collection_name=name,
-            vectors_config=models.VectorParams(
+        kwargs: dict[str, Any] = {
+            "collection_name": name,
+            "vectors_config": models.VectorParams(
                 size=embedding_dimensions(), distance=models.Distance.COSINE
             ),
+        }
+        if sparse:
+            kwargs["sparse_vectors_config"] = {
+                SPARSE_VECTOR_NAME: models.SparseVectorParams(
+                    index=models.SparseIndexParams(on_disk=True)
+                ),
+            }
+        client.create_collection(**kwargs)
+        logger.info(
+            "Created Qdrant collection %r (mode=%s, sparse=%s)", name, qdrant_mode(), sparse
         )
-        logger.info("Created Qdrant collection %r (mode=%s)", name, qdrant_mode())
     return False
 
 
@@ -86,23 +102,30 @@ def write_documents(
     name: str,
     *,
     sparse_embedding: Any = None,
+    retrieval_mode: Any = None,
 ) -> Any:
     """Upsert *documents*, creating the collection when it is absent.
 
-    ``sparse_embedding`` is set only for hybrid mode; a dense-only store must not
-    receive one, or the collection ends up with a sparse vector name the dense
-    retriever never populates.
+    ``sparse_embedding`` and ``retrieval_mode`` belong on the *constructor*.
+    ``add_documents`` forwards unknown keywords to ``client.upsert``, which
+    accepts and discards them, so passing ``sparse_embedding`` there writes
+    dense vectors into a collection the hybrid retriever then refuses - and the
+    collection cannot gain a sparse schema afterwards.
     """
-    from langchain_qdrant import QdrantVectorStore
+    from langchain_qdrant import QdrantVectorStore, RetrievalMode
 
     from terminus.llm.factory import get_embedder
 
-    _ensure_collection(client, name)
+    mode = retrieval_mode or RetrievalMode.DENSE
+    wants_sparse = mode in (RetrievalMode.SPARSE, RetrievalMode.HYBRID)
+
+    _ensure_collection(client, name, sparse=wants_sparse)
     store = QdrantVectorStore(
-        client=client, collection_name=name, embedding=get_embedder()
+        client=client,
+        collection_name=name,
+        embedding=get_embedder(),
+        sparse_embedding=sparse_embedding if wants_sparse else None,
+        retrieval_mode=mode,
     )
-    options: dict[str, Any] = {}
-    if sparse_embedding is not None:
-        options["sparse_embedding"] = sparse_embedding
-    store.add_documents(documents, batch_size=BATCH_SIZE, **options)
+    store.add_documents(documents, batch_size=BATCH_SIZE)
     return store

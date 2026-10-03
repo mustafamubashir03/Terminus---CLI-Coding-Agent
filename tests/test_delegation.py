@@ -85,12 +85,11 @@ async def test_the_real_path_builds_an_agent_on_the_existing_factory(monkeypatch
 
     built = {}
 
-    async def fake_build_agent(tools_override=None, *, model=None, provider=None,
-                               max_model_calls=None):
-        built["tools"] = tools_override
-        built["model"] = model
-        built["provider"] = provider
-        built["max_model_calls"] = max_model_calls
+    async def fake_build_agent(policy):
+        built["tools"] = list(policy.tools)
+        built["model"] = policy.model
+        built["provider"] = policy.provider
+        built["max_model_calls"] = policy.model_call_limit
         return _FakeAgent(built)
 
     monkeypatch.setattr(factory, "build_agent", fake_build_agent)
@@ -114,7 +113,7 @@ async def test_the_child_runs_on_its_own_thread_not_the_parent_s(monkeypatch):
 
     sink = {}
 
-    async def fake_build_agent(**_kw):
+    async def fake_build_agent(policy):
         return _FakeAgent(sink)
 
     monkeypatch.setattr(factory, "build_agent", fake_build_agent)
@@ -145,7 +144,7 @@ async def test_the_child_runs_under_its_own_execution_context(monkeypatch):
             seen["ctx"] = current_execution()
             return {"messages": [{"role": "assistant", "content": "ok"}]}
 
-    async def fake_build_agent(**_kw):
+    async def fake_build_agent(policy):
         return _CapturingAgent()
 
     monkeypatch.setattr(factory, "build_agent", fake_build_agent)
@@ -177,7 +176,7 @@ async def test_a_write_capable_child_gets_write_permission_under_its_own_scope(m
             seen["ctx"] = current_execution()
             return {"messages": [{"role": "assistant", "content": "ok"}]}
 
-    async def fake_build_agent(**_kw):
+    async def fake_build_agent(policy):
         return _CapturingAgent()
 
     monkeypatch.setattr(factory, "build_agent", fake_build_agent)
@@ -206,9 +205,8 @@ async def test_a_requested_model_goes_through_the_existing_router(monkeypatch):
 
     built = {}
 
-    async def fake_build_agent(tools_override=None, *, model=None, provider=None,
-                               max_model_calls=None):
-        built.update(model=model, provider=provider)
+    async def fake_build_agent(policy):
+        built.update(model=policy.model, provider=policy.provider)
         return _FakeAgent({})
 
     monkeypatch.setattr(factory, "build_agent", fake_build_agent)
@@ -255,27 +253,33 @@ async def test_a_child_cannot_widen_its_own_tools_by_asking():
 # ---------------------------------------------------------------------------
 
 
-def test_a_result_carries_lineage_status_and_verification():
+def test_a_result_carries_lineage_status_and_outcome():
     result = AgentResult(
         agent_id="agent-1", role="implementer", status=AgentStatus.COMPLETED,
-        summary="did the thing", findings=["a"], verification="passed",
+        summary="did the thing", findings=["a"],
     )
     data = result.as_dict()
     for key in ("agent_id", "role", "status", "summary", "findings",
-                "verification", "duration_seconds", "skills", "tools"):
+                "duration_seconds", "skills", "tools"):
         assert key in data
-    assert data["verification"] == "passed"
 
 
-def test_verification_defaults_to_not_required():
-    assert AgentResult(agent_id="a", role="researcher").verification == "not_required"
-
-
-@sync_async
-async def test_a_child_never_marks_itself_verified():
-    """A child's claim is a claim; the parent owns verification."""
-    result = await spawn_agent("did it", runner=ok_runner)
-    assert result.verification != "verified"
+# AgentResult used to carry a ``verification`` field, documented as the
+# distinction between a child that ran the tests and one that only read code.
+# Nothing ever set it, so it was always ``"not_required"`` and every assertion
+# about it was restating the default. The distinction it was reaching for is
+# carried by ``files_changed`` and ``tests_run``, which the framework callbacks
+# populate from what actually ran; whether the work is correct is the parent's
+# call to make from the report, not a field the child fills in.
+def test_a_result_reports_what_actually_ran():
+    result = AgentResult(
+        agent_id="agent-1", role="implementer", status=AgentStatus.COMPLETED,
+        files_changed=["src/terminus/app.py"], tests_run=["pytest tests/test_app.py"],
+    )
+    data = result.as_dict()
+    assert data["files_changed"] == ["src/terminus/app.py"]
+    assert data["tests_run"] == ["pytest tests/test_app.py"]
+    assert "verification" not in data
 
 
 # ---------------------------------------------------------------------------

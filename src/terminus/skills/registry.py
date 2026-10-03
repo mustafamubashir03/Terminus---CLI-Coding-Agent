@@ -10,7 +10,6 @@ logger = get_logger(__name__)
 
 SKILL_FILENAME="SKILL.md"
 
-# --- context budget -------------------------------------------------------
 # A skill is knowledge loaded into a prompt, so every dimension of it is
 # bounded. These are deliberately explicit constants rather than tuning
 # parameters: a skill system that can grow the prompt without limit is a
@@ -197,7 +196,6 @@ class SkillRegistry:
         self.refs: dict[str, SkillRef] = {}
         self.shadowed: dict[str, list[SkillRef]] = {}
         self.load_errors: dict[str, str] = {}
-        # Explicit roots win; otherwise project + user + built-in are searched.
         self.sources: dict[str, Path] = dict(sources) if sources else {
             "project": Path(skills_dir),
             "user": user_skills_dir(),
@@ -232,7 +230,6 @@ class SkillRegistry:
                 if ref is None:
                     continue
                 if ref.name in self.refs:
-                    # A lower-precedence root already claimed this name.
                     self.shadowed.setdefault(ref.name, []).append(ref)
                     logger.info(
                         "Skill %s from %s is shadowed by %s (%s wins)",
@@ -437,13 +434,3 @@ class SkillRegistry:
             meta["name"] = skill_file.parent.name
 
         return meta, body.strip()
-
-    def _list_support_files(self,skill_dir:Path)->list[Path]:
-        """
-        List all support files in the skill directory
-        """
-        support_files = []
-        for item in skill_dir.rglob("*"):
-            if item.is_file() and item != skill_dir / SKILL_FILENAME:
-                support_files.append(item)
-        return support_files

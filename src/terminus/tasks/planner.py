@@ -149,7 +149,6 @@ def _extract_json(text: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    # Strip ```json ... ```  / ``` ... ``` fences.
     if t.startswith("```"):
         lines = t.splitlines()
         if lines and lines[0].strip().lstrip("`").strip() in ("json", ""):
@@ -164,7 +163,6 @@ def _extract_json(text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # Fallback: extract a balanced { ... } block (first { to last }).
     start = t.find("{")
     end = t.rfind("}")
     if start != -1 and end != -1 and end > start:

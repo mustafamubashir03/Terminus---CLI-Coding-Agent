@@ -245,17 +245,17 @@ async def test_agent_stream_timeout_raises_and_marks_task_failed(tmp_path: Path)
     async def _fake_tools():
         return {"implement": []}
 
-    original_create_agent = exec_mod.create_agent
+    original_build_agent = exec_mod.build_agent
     original_tools = exec_mod._tool_plans
     original_get_chat_model = exec_mod.get_chat_model
 
     calls = {"create_agent": 0}
 
-    def _fake_create_agent(*args, **kwargs):
+    async def _fake_build_agent(policy):
         calls["create_agent"] += 1
         return _HungAgent()
 
-    exec_mod.create_agent = _fake_create_agent
+    exec_mod.build_agent = _fake_build_agent
     exec_mod._tool_plans = _fake_tools
     exec_mod.get_chat_model = lambda *a, **kw: _FakeLlm()
 
@@ -272,7 +272,7 @@ async def test_agent_stream_timeout_raises_and_marks_task_failed(tmp_path: Path)
         assert result.success is False
         assert "timed out" in result.error
     finally:
-        exec_mod.create_agent = original_create_agent
+        exec_mod.build_agent = original_build_agent
         exec_mod._tool_plans = original_tools
         exec_mod.get_chat_model = original_get_chat_model
         exec_mod._AGENT_STREAM_TIMEOUT_SECONDS = original_timeout

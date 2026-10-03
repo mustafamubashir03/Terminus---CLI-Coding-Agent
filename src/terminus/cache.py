@@ -22,12 +22,6 @@ from terminus.observability.logging import get_logger
 
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Prompt string cache
-#
-# Keys must include the identity of whatever the prompt describes (today: the
-# project root), so two workspaces in one process never share a snapshot.
-# ---------------------------------------------------------------------------
 _prompt_cache: dict[str, str] = {}
 
 
@@ -42,9 +36,6 @@ def get_cached_prompt(key: str) -> str | None:
     return _prompt_cache.get(key)
 
 
-# ---------------------------------------------------------------------------
-# LLM client cache  (reuses client objects for the same model+provider)
-# ---------------------------------------------------------------------------
 _llm_cache: dict[str, Any] = {}
 
 

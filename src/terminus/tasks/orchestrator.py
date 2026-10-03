@@ -173,7 +173,18 @@ class TaskOrchestrator:
                 break
 
             batch = ready[: self.max_concurrent]
-            await asyncio.gather(*[self._execute(task) for task in batch])
+            # return_exceptions=True, and _execute contains its own failures.
+            # Without both, one unexpected error propagated out of gather,
+            # skipped finalize_project_status below, and left the project row
+            # stuck at in_progress - where `/plan continue` would then resume
+            # nothing, forever.
+            results = await asyncio.gather(
+                *[self._execute(task) for task in batch],
+                return_exceptions=True,
+            )
+            for task, outcome in zip(batch, results, strict=True):
+                if isinstance(outcome, BaseException):
+                    self._record_unexpected_failure(task, outcome)
 
             # Brief pause between task batches to avoid bursting free-tier
             # rate limits (OpenRouter 429s queue requests beyond the timeout).
@@ -181,6 +192,24 @@ class TaskOrchestrator:
                 await asyncio.sleep(3)
 
         self.store.finalize_project_status(project_id)
+
+    def _record_unexpected_failure(self, task: dict, exc: BaseException) -> None:
+        """Fail a task whose execution raised rather than returned.
+
+        An exception here is an infrastructure or data fault - a corrupted row,
+        a database error - not the agent's answer, so it is logged and recorded
+        as a non-retryable task failure. Retrying a fault that is not the model's
+        would burn the whole retry budget on the same broken input.
+        """
+        task_id = task.get("id", "?")
+        detail = f"[failed] unexpected {type(exc).__name__}: {exc}"
+        logger.error("Task %s raised out of execution: %s: %s",
+                     task_id, type(exc).__name__, exc, exc_info=True)
+        console.print(f"[bold red]Task {task_id} could not be run: {exc}[/bold red]")
+        try:
+            self.store.fail_task(task["project_id"], task_id, detail, force=True)
+        except Exception as store_exc:  # pragma: no cover - the store is also broken
+            logger.error("Could not record the failure of task %s: %s", task_id, store_exc)
 
     def _explain_blocked_state(self, project_id: str) -> None:
         blocked = self.store.get_blocked_by_failed(project_id)
@@ -302,13 +331,11 @@ small enough that a systematically unplannable goal fails in a reasonable time.
 """
 
 
-async def _plan_with_approval(goal: str) -> tuple[object | None, str]:
-    """Plan *goal* and get it approved. Returns ``(plan, feedback)``.
+async def _plan_with_approval(goal: str) -> object | None:
+    """Plan *goal* and get it approved. Returns the plan, or None if there is none.
 
-    ``(None, ...)`` means no approved plan. The human-in-the-loop rejection
-    path asks what to change and re-plans with the answer, which is why the
-    feedback string is returned alongside: a caller that wants to report why a
-    plan failed needs it.
+    A rejection asks what to change and re-plans with the answer, so the feedback
+    string stays local to this function.
 
     Re-planning needs a person. Without a terminal there is nobody to ask, so a
     rejected plan stops rather than blocking forever on a pipe or in CI.
@@ -321,25 +348,38 @@ async def _plan_with_approval(goal: str) -> tuple[object | None, str]:
             validate_plan(raw_plan)
             approved = present_plan_for_approval(raw_plan)
             if approved is not None:
-                return approved, feedback
+                return approved
             if not human_is_present():
                 console.print(
                     "[bold red]Plan rejected and no interactive terminal is "
                     "available to ask what to change it. Not creating a project.[/bold red]"
                 )
-                return None, feedback
+                return None
             feedback = input("What should be changed or added in the plan? : \n").strip()
             console.print("\n Re-planning with your feedback\n", style="cyan")
         except Exception as exc:
-            detail = format_failure(classify_failure(exc, provider=provider), provider=provider)
+            failure = classify_failure(exc, provider=provider)
+            detail = format_failure(failure, provider=provider)
             logger.error("Plan generation failed: %s", detail)
+            if not failure.retryable:
+                # A missing key, a rejected key, an unknown model: the same
+                # request will fail the same way. It was logging
+                # "retryable=false" and then retrying anyway, which turned one
+                # clear error into three identical ones and buried the cause.
+                console.print(f"[bold red]Plan generation failed: {detail}[/bold red]")
+                if "is not set" in detail or "API key" in detail:
+                    console.print(
+                        "[yellow]No API key for this provider. Add one with "
+                        "[cyan]terminus setup[/cyan], then try again.[/yellow]"
+                    )
+                return None
             if attempt < MAX_PLAN_ATTEMPTS - 1:
                 console.print(
                     f"[yellow]Plan failed, retrying ({attempt + 2}/{MAX_PLAN_ATTEMPTS})...[/yellow]"
                 )
             else:
                 console.print(f"[bold red]Plan generation failed: {detail}[/bold red]")
-    return None, feedback
+    return None
 
 
 async def handle_plan_command(goal: str) -> None:
@@ -401,7 +441,7 @@ async def handle_plan_command(goal: str) -> None:
         return
 
     console.print("[bold yellow]Planning new project...[/bold yellow]")
-    approved_plan, extra_content = await _plan_with_approval(goal)
+    approved_plan = await _plan_with_approval(goal)
     if approved_plan is None:
         console.print("[red]No approved plan; not creating a project.[/red]")
         return

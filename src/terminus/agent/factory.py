@@ -23,30 +23,22 @@ fallback chain rather than each having their own routing.
 
 from terminus.memory.short_term import get_summarization_middleware
 from terminus.memory.short_term import get_checkpointer
+from terminus.agent.observation import ObservationMiddleware
 from terminus.llm.factory import get_chat_model, get_current_model_label, get_llm
 from terminus.context.environment import build_startup_context
 from terminus.workspace import project_root
-from terminus.tools.codebase_tool import search_codebase
+from terminus.agents_md import agents_md_section, load_agents_md
+from terminus.tools import registry
 from terminus.observability.logging import get_logger
 from langchain.agents import create_agent
-from terminus.tools.filesystem_tools import (
-    list_directory,
-    read_file,
-    file_exists,
-    grep,
-    write_file,
-    edit_file,
-)
-from terminus.tools.web_tools import web_search, web_fetch
-from terminus.tools.shell_tools import run_command
-from terminus.skills.skill_tools import load_skill, build_skills_prompt
+from terminus.skills.skill_tools import build_skills_prompt
 from terminus.project_context import project_prompt_section
-from terminus.tools.project_status_tool import project_status
-from terminus.tools.spawn_agent_tool import spawn_agent
 from terminus.cache import get_cached_prompt, cache_prompt
 from terminus.permissions import PermissionLevel, PermissionPolicy
 from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
 from typing import Any
+from dataclasses import dataclass
+from pathlib import Path
 import sys
 
 logger = get_logger(__name__)
@@ -165,6 +157,96 @@ def interactive_approver(command: str, working_directory: str,
     return answer in ("y", "yes")
 
 
+def workspace_section(workspace: Path | None = None) -> str:
+    """Tell the model what a workspace is, in the terms it will act on.
+
+    Concepts only. Every boundary named here is enforced in
+    :mod:`terminus.workspace`, not by this text: the model is told where it is
+    and what the filesystem means, and the runtime decides what it may reach.
+
+    Kept short deliberately. A long section on filesystems would be instructions
+    the model has to follow rather than facts it can rely on, and it would age
+    worse than the code that enforces it.
+    """
+    root = workspace or project_root()
+    return f"""## Workspace
+You are working in one workspace: {root}
+- Every file path you pass is resolved inside that workspace and is relative to it. A path that points outside it is rejected; do not try to reach files elsewhere on the machine.
+- The filesystem is durable state, not scratch space. What you write is still there after this turn ends, and other agents or later sessions working in this same workspace can read it.
+- So keep anything worth keeping in files rather than trying to hold it in your context: findings, notes, intermediate results, a plan you are working through. '.terminus/notes/', '.terminus/research/', '.terminus/plans/' exist for that and are yours to create.
+- For knowledge that should outlive the task - conventions you inferred, a decision you made, a trap you fell into - AGENTS.md is the place. It is loaded into every session in this workspace, so a note there reaches work you have not started yet. Scratch files do not.
+- When your context no longer holds what you need - a finding from earlier, the file you edited twenty calls ago - read it back from the file instead of guessing or searching for it again.
+- Files are how work is handed over. Write down what the next step needs and let whoever picks it up - including you in a later session - read that instead of relying on what was said."""
+
+
+def versioning_section(tools: Any = ()) -> str:
+    """Tell the model what Git means here - only as far as its own tools reach.
+
+    Built per agent from the tool names that agent actually has, rather than
+    written once as a static section. A child agent inherits the /ask prompt, and
+    a static section would tell a researcher it can checkpoint work it has no tool
+    to checkpoint with; the model would then spend calls discovering the absence.
+    The same reasoning applies in reverse: a worker that only sees the readers is
+    told exactly that.
+
+    Kept to what the tools do. Git supplies the mechanism; permissions and the
+    workspace still decide what actually happens, and the text must not imply
+    otherwise.
+    """
+    names = {getattr(tool, "name", str(tool)) for tool in tools}
+    readers = [n for n in ("git_status", "git_diff", "git_log") if n in names]
+    writers = [
+        n for n in ("git_commit", "git_checkout", "git_branch") if n in names
+    ]
+    if not readers and not writers:
+        return ""
+
+    lines = ["## Versioning with Git", (
+        "The workspace may be a Git repository. The filesystem is its state; Git "
+        "is the history of that state, so recovery is a real operation rather "
+        "than something you reconstruct from memory. Git tools report plainly "
+        "when the workspace is not a repository; they never create one."
+    )]
+    if readers:
+        lines.append(
+            "- Inspect before you change anything: 'git_status' for what is "
+            "modified, staged and untracked, 'git_diff' for the actual text, "
+            "'git_log' for what the recent checkpoints were."
+        )
+    if "git_commit" in names:
+        lines.append(
+            "- 'git_commit' saves the whole workspace as a checkpoint. It stages "
+            "everything first, so it records what is there, not only what you "
+            "staged. Commit when a change is coherent and verified - not after "
+            "every step."
+        )
+    if "git_branch" in names:
+        lines.append(
+            "- 'git_branch(\"name\")' creates a branch at the current commit; it "
+            "does not switch to it. Use it to try something without touching the "
+            "branch you started on. Merge is not available."
+        )
+    if "git_checkout" in names:
+        lines.append(
+            "- 'git_checkout' either moves you onto a branch or detaches HEAD at "
+            "a commit; the result tells you which happened. Read the result "
+            "before assuming where you are. If it fails because local changes "
+            "would be overwritten, that work is still there - commit it or "
+            "revert it yourself. Nothing is discarded for you."
+        )
+    if writers:
+        lines.append(
+            "- push, pull, fetch, merge, rebase and stash are NOT available as "
+            "tools, and there is no tool for an arbitrary git command."
+        )
+    lines.append(
+        "- Git gives you mechanisms, not guarantees. A checkpoint you created is "
+        "only as good as the commit you actually made, and whether an operation "
+        "was allowed is decided by the runtime, not by you."
+    )
+    return "\n".join(lines)
+
+
 def _build_static_prompt() -> str:
     """The slow-moving half of the /ask system prompt, cached per workspace.
 
@@ -194,6 +276,7 @@ def _build_static_prompt() -> str:
     parts = [
         IDENTITY,
         build_startup_context(workspace),
+        workspace_section(workspace),
         TOOL_RULES,
         TOOL_GUIDE,
         WORKFLOW,
@@ -205,55 +288,52 @@ def _build_static_prompt() -> str:
     return cache_prompt(key, "\n\n".join(parts))
 
 
-def _build_system_prompt() -> str:
+def _build_system_prompt(tools: Any = ()) -> str:
     """Compose the /ask system prompt: cached static material plus live project state.
 
-    ``build_agent`` is called once per question, so the project section is read
-    from TaskStore on each turn and stays current, while the expensive-to-build
-    half is still served from cache.
+    ``build_agent`` is called once per question, so everything added here is
+    rebuilt per turn: the project section from TaskStore, and AGENTS.md from the
+    workspace. Both are read fresh precisely because they change while the process
+    lives. Only the static half above is cached.
+
+    ``tools`` are the tools *this* agent has. They are not part of the cached
+    static half, because the versioning section depends on them and the cache is
+    shared by every agent in the process - caching it would hand a child agent's
+    prompt the parent's Git capabilities.
 
     create_agent turns this string into a SystemMessage that it prepends
     locally at each model call, so it never enters the agent's message state and
     is never duplicated into the checkpoint.
     """
-    project_section = project_prompt_section()
-    if not project_section:
-        return _build_static_prompt()
-    return f"{_build_static_prompt()}\n\n{project_section}"
+    static = _build_static_prompt()
+    parts = [
+        static,
+        versioning_section(tools),
+        agents_md_section(load_agents_md()),
+        project_prompt_section(),
+    ]
+    return "\n\n".join(part for part in parts if part)
 
 
 # The /ask tool list, as data so tests (and a future child agent) can inspect it
 # without parsing source or building a real graph.
 #
-# Deliberately absent: 'delete_file', 'append_file', 'run_in_directory' and any
-# external GitHub MCP server. 'run_command' is present but is policy-gated at
-# call time by terminus.permissions - see tools/shell_tools.py.
-ASK_TOOLS = (
-    search_codebase,
-    grep,
-    list_directory,
-    read_file,
-    file_exists,
-    write_file,
-    edit_file,
-    web_search,
-    web_fetch,
-    run_command,
-    load_skill,
-    project_status,
-    spawn_agent,
-    )
+# Which tools /ask gets is decided by name in terminus.tools.registry, which is
+# also the single catalogue every other toolset in the project resolves through.
+# The comment about what is deliberately absent lives there, next to the names.
+ASK_TOOLS = registry.ask_tools()
 
 
 def tools_by_name() -> dict[str, Any]:
-    """The agent toolset indexed by tool name.
+    """The /ask toolset indexed by tool name.
 
-    A child agent is configured with tool *names* (a role is a permission
-    description, and names are what a prompt or a config file can express).
-    This is where a name becomes the real tool, so a child can only ever be
-    handed something that is genuinely in the parent's own toolset.
+    A child agent is configured with tool *names* - a role is a permission
+    description, and names are what a prompt or a config file can express. This
+    is where a name becomes the real tool, so a child can only ever be handed
+    something that is genuinely in the parent's own toolset.
     """
-    return {getattr(tool, "name", str(tool)): tool for tool in ASK_TOOLS}
+    catalogue = registry.catalogue()
+    return {tool.name: tool for tool in ASK_TOOLS if (tool.name in catalogue)}
 
 
 DEFAULT_ASK_MODEL_CALLS = 16
@@ -265,66 +345,127 @@ it has rather than burning the budget.
 """
 
 
-async def build_agent(tools_override: list | None = None, *, model: str | None = None,
-                      provider: str | None = None, max_model_calls: int | None = None):
-    """Create and return the /ask agent.
+@dataclass(frozen=True)
+class AgentPolicy:
+    """Everything a caller can vary about one agent run.
 
-    Read/discovery tools, controlled write tools ('write_file', 'edit_file'),
-    web research tools, and 'run_command' for real shell execution. Still no
-    'delete_file', no 'append_file' and no external GitHub MCP server.
+    The loop itself is not here: LangGraph owns it. This is the complete set of
+    differences between /ask, a child agent and a /plan worker, which is why
+    there is one ``build_agent`` rather than three ways of assembling a graph.
 
-    ``tools_override`` is how a delegated child agent is built with a narrower
-    tool set than /ask - see ``terminus.agents.spawn``. A child cannot widen its
-    own reach: the names it gets are intersected with its role's and with what
-    the parent has, in ``ChildAgent``.
-
-    This function builds an agent; it does not authorise it. Permission lives
-    with the execution (see terminus.execution), so the caller wraps the agent
-    run in an :func:`execution_scope`. A child agent inherits its parent's
-    policy simply by running inside the parent's scope - it cannot obtain a
-    more permissive one by calling this function.
-
-    Execution budget, precisely:
-      * ModelCallLimitMiddleware(run_limit) caps calls to the MODEL node.
-      * ToolCallLimitMiddleware(tool_name=None) caps calls to ALL tools per run
-        and, with exit_behavior="continue", blocks the excess with a tool error
-        and lets the agent finish, instead of ending the run.
-      * ToolCallLimitMiddleware(tool_name="search_codebase") is a tighter
-        per-tool cap on top of the global one.
-      The summarisation middleware makes its own LLM calls, which are not
-      counted by run_limit.
-
-    ``model``/``provider`` override the configured route for this one agent,
-    and go through the same ``get_chat_model`` router - so a child agent
-    participates in the existing fallback chain rather than needing a model
-    abstraction of its own. They are also how a child gets a *smaller* budget
-    than /ask: a delegated task is a bounded unit of work, not a conversation.
+    ``tool_call_limits`` is ``(tool_name, limit)`` pairs. A ``None`` name is the
+    cap on every tool.
     """
-    llm = get_llm() if not (model or provider) else get_chat_model(
-        model or get_current_model_label() or "", provider
-    )
-    full_prompt = _build_system_prompt()
 
-    tools = list(tools_override) if tools_override else list(ASK_TOOLS)
+    tools: tuple
+    system_prompt: str
+    model: str | None = None
+    provider: str | None = None
+    model_call_limit: int = DEFAULT_ASK_MODEL_CALLS
+    tool_call_limits: tuple[tuple[str | None, int], ...] = (
+        (None, 40),
+        ("search_codebase", 4),
+    )
+    tool_limit_behaviour: str = "continue"
+    summarize: bool = True
+    checkpoint: bool = True
+    verify_observations: bool = True
+    """Send the model back once if it tries to claim success it never observed.
+
+    On for every surface by default. A turn that mutates nothing - a research or
+    review turn - is unaffected, because the rule only fires after a mutation.
+    A /plan worker being re-run after a failure can set it False, because that
+    attempt has already been observed by whoever read the log.
+    """
+
+
+async def build_agent(policy: AgentPolicy):
+    """Assemble a LangGraph agent from *policy*.
+
+    The one place a Terminus agent is constructed. Everything downstream - /ask,
+    ``spawn_agent``, /plan workers - differs only in the policy it passes.
+
+    Budgets, in the order they apply:
+
+    * ``model_call_limit`` caps calls to the model node and, with
+      ``exit_behavior="end"``, jumps the graph to its end rather than raising.
+    * each ``tool_call_limits`` entry caps calls; with
+      ``tool_limit_behaviour="continue"`` the excess comes back to the model as a
+      tool error so it can adapt, and with ``"end"`` the run stops.
+
+    The summarisation middleware makes its own model calls, which neither limit
+    counts.
+    """
+    llm = (
+        get_chat_model(policy.model or get_current_model_label() or "", policy.provider)
+        if (policy.model or policy.provider)
+        else get_llm()
+    )
+
     middlewares = [
-        ModelCallLimitMiddleware(
-            run_limit=max_model_calls or DEFAULT_ASK_MODEL_CALLS,
-            exit_behavior="end",
+        ModelCallLimitMiddleware(run_limit=policy.model_call_limit, exit_behavior="end"),
+        *(
+            ToolCallLimitMiddleware(
+                tool_name=name,
+                run_limit=limit,
+                exit_behavior=policy.tool_limit_behaviour,
+            )
+            for name, limit in policy.tool_call_limits
         ),
-        ToolCallLimitMiddleware(tool_name=None, run_limit=40, exit_behavior="continue"),
-        ToolCallLimitMiddleware(tool_name="search_codebase", run_limit=4, exit_behavior="continue"),
-        get_summarization_middleware(),
     ]
-    checkpointer = await get_checkpointer()
+    if policy.summarize:
+        middlewares.append(get_summarization_middleware())
+    if policy.verify_observations:
+        middlewares.append(ObservationMiddleware())
+
+    checkpointer = await get_checkpointer() if policy.checkpoint else None
     logger.info(
-        "Creating agent (tools=%d, model=%s)", len(tools), getattr(llm, "model_name", "?")
+        "Creating agent (tools=%d, model=%s)", len(policy.tools), getattr(llm, "model_name", "?")
     )
     return create_agent(
         llm,
-        tools=tools,
-        system_prompt=full_prompt,
+        tools=list(policy.tools),
+        system_prompt=policy.system_prompt,
         checkpointer=checkpointer,
-        middleware=middlewares
+        middleware=middlewares,
+    )
+
+
+def ask_policy() -> AgentPolicy:
+    """The policy for one /ask turn.
+
+    The prompt is rebuilt here rather than cached as a constant, because
+    ``build_agent`` runs once per question and the project section must be read
+    fresh each time; only the static half inside it is cached.
+    """
+    return AgentPolicy(tools=ASK_TOOLS, system_prompt=_build_system_prompt(ASK_TOOLS))
+
+
+def child_policy(
+    tools: list,
+    instructions: str,
+    *,
+    model: str | None,
+    provider: str | None,
+    model_call_limit: int,
+    tool_call_limit: int,
+) -> AgentPolicy:
+    """The policy for a delegated child: the parent's loop, a narrower self.
+
+    A child keeps the shared identity, environment and tool rules - it is working
+    in the same project under the same rules - and its own instructions are
+    appended. What it does not inherit is the parent's *conversation*.
+
+    Both limits come from the role's advertised budget, so the budget a
+    ``/agents`` listing shows is the budget the child actually runs under.
+    """
+    return AgentPolicy(
+        tools=tuple(tools),
+        system_prompt=f"{_build_system_prompt(tools)}\n\n{instructions}",
+        model=model,
+        provider=provider,
+        model_call_limit=model_call_limit,
+        tool_call_limits=((None, tool_call_limit), ("search_codebase", 4)),
     )
 
 

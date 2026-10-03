@@ -592,9 +592,10 @@ def test_a_child_inherits_rather_than_widening(in_tmp_cwd):
     factory.get_llm = lambda: "LLM"
     factory.get_summarization_middleware = lambda: "MW"
     factory.get_checkpointer = lambda: _async_value("CP")
+    from terminus.agent.factory import ask_policy
     try:
         with execution_scope(ask_context(strict)):
-            asyncio.run(factory.build_agent())
+            asyncio.run(factory.build_agent(ask_policy()))
     finally:
         (factory.create_agent, factory.get_llm,
          factory.get_summarization_middleware, factory.get_checkpointer) = real

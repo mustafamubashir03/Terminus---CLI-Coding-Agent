@@ -114,11 +114,6 @@ def _clip_list(items: Any, limit: int) -> list[str]:
     return [_clip(str(i), 120) for i in list(items)[:limit] if str(i).strip()]
 
 
-# ---------------------------------------------------------------------------
-# Facts
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class TaskFact:
     """One task, as far as an agent or a user needs to see it."""
@@ -174,11 +169,6 @@ class ProjectFacts:
         return sum(self.counts.values())
 
 
-# ---------------------------------------------------------------------------
-# Project resolution
-# ---------------------------------------------------------------------------
-
-
 def resolve_project_id(store: Any) -> str | None:
     """The project this workspace is working on, or None.
 
@@ -212,11 +202,6 @@ def plan_fields(plan_json: str | None) -> dict[str, Any]:
     except (ValueError, TypeError):
         return {}
     return data if isinstance(data, dict) else {}
-
-
-# ---------------------------------------------------------------------------
-# Collection
-# ---------------------------------------------------------------------------
 
 
 def collect_project_facts(
@@ -346,11 +331,6 @@ def _available_skills() -> list[str]:
         return sorted(_get_registry().skills)[:MAX_SKILLS_SHOWN]
     except Exception:
         return []
-
-
-# ---------------------------------------------------------------------------
-# Rendering
-# ---------------------------------------------------------------------------
 
 
 def render(facts: ProjectFacts, *, include_results: bool = True) -> str:

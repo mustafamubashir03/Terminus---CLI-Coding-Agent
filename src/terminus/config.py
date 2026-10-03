@@ -3,13 +3,27 @@
 Precedence, highest first:
 
     the current directory's ``config.yaml``
-    the packaged ``config.yaml`` (shipped defaults for an installed Terminus)
+    ``~/.terminus/config.yaml``          (this developer's defaults, all projects)
+    the packaged ``config.yaml``          (shipped defaults for an installed Terminus)
     ``DEFAULT_CONFIG`` below
 
 The first file that exists wins outright - it is *not* a merge of all of them.
-That is deliberate. Layering three files would make it impossible to say where
-any single value came from, and a user who edits their project config would have
-to know which of the other layers was overriding them.
+That is deliberate. Layering them would make it impossible to say where any
+single value came from, and a user who edits their project config would have to
+know which of the other layers was overriding them. The global file sits *below*
+the project file for the same reason: a repository's own configuration is more
+specific than a general default, and must not be surprised by it.
+
+What each layer is for:
+
+* project ``config.yaml`` - settings that belong to one repository: which vector
+  store this project indexes into, project-specific model overrides.
+* ``~/.terminus/config.yaml`` - settings that should follow the developer: their
+  default provider and model. Written by ``terminus config set --global``.
+* packaged ``config.yaml`` - the shipped defaults.
+
+Credentials are deliberately **not** in any of these. They live in ``.env`` or
+``~/.terminus/credentials.env``; see :mod:`terminus.user_config`.
 
 ``CONFIG`` is the resolved result, built once at import. Everything else in
 Terminus reads it rather than re-reading the file, so there is exactly one
@@ -46,6 +60,15 @@ DEFAULT_CONFIG = {
         "db_path": ".terminus/memory/terminus.db",
         "summarize_at_tokens": 4000,
         "max_messages": 20,
+    },
+    "observability": {
+        # LangSmith tracing. Off unless asked for, deliberately: LangChain reads
+        # LANGSMITH_TRACING straight out of the environment, so a key left in a
+        # project's .env is enough to start shipping every prompt to a remote
+        # service on every run - and to start printing that service's rate-limit
+        # warnings into the middle of an answer when the quota runs out. Nothing
+        # in Terminus needs tracing to work, so it earns an explicit switch.
+        "tracing": False,
     },
     "tasks": {
         "db_path": ".terminus/tasks/tasks.db",
@@ -87,7 +110,6 @@ DEFAULT_CONFIG = {
         # configuration keeps working untouched.
         "mode": "",
         "path": ".terminus/qdrant",
-        "url": "",
     },
     "chromadb": {
         "persist_dir": ".terminus/chromadb/",
@@ -95,43 +117,105 @@ DEFAULT_CONFIG = {
     },
 }
 
+CONFIG: dict = {}
 CONFIG_SOURCE: Path | None = None
 CONFIG_SOURCE_KIND = "default"
+#: Every layer that actually contributed at least one key, lowest precedence
+#: first, as (kind, path). ``CONFIG_SOURCE`` alone cannot express a merge, and
+#: "your project config" is not a useful answer when the project only set one
+#: key and inherited the provider from your global file.
+CONFIG_SOURCE_LAYERS: list[tuple[str, Path]] = []
 
 
 def _merge(base: dict, override: dict) -> dict:
+    """Overlay ``override`` on ``base``, one key at a time.
+
+    An override value of ``None`` is skipped rather than assigned. YAML reads a
+    bare ``llm:`` (a section someone emptied out, or commented the contents of)
+    as ``None``, and assigning that would replace the whole section - discarding
+    the defaults and the user's global settings along with it, then failing
+    later somewhere unrelated with a NoneType error. "No value here" has to mean
+    "no opinion here", or the layering is not safe to hand-edit.
+    """
     merged = deepcopy(base)
     for key, value in override.items():
+        if value is None:
+            continue
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _merge(merged[key], value)
+            merged[key] = _merge(merged.get(key), value)
         else:
-            merged[key] = value
+            merged[key] = deepcopy(value)
     return merged
 
 
+def _read_layer(path: Path) -> dict | None:
+    """Parse one config file, or return None when it is not usable.
+
+    A file that does not exist contributes nothing, which is what lets a project
+    inherit from global instead of shadowing it.
+    """
+    if not path.is_file():
+        return None
+    try:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Unable to load configuration {path}: {exc}") from exc
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Configuration {path} must contain a YAML mapping")
+    return loaded
+
+
 def load_config() -> dict:
-    global CONFIG_SOURCE, CONFIG_SOURCE_KIND
-    candidates = [
-        (Path.cwd() / "config.yaml", "cwd"),
+    """Layer every config file, lowest precedence first.
+
+    Order is built-in defaults, then the packaged config, then the user's
+    global ``~/.terminus/config.yaml``, then this project's ``config.yaml``.
+    A later file overrides only the keys it actually mentions, so setting one
+    value in a project no longer silently discards the rest of the user's
+    global setup - which is what "project overrides global" has to mean for the
+    hierarchy to be coherent.
+    """
+    global CONFIG_SOURCE, CONFIG_SOURCE_KIND, CONFIG_SOURCE_LAYERS
+    candidates: list[tuple[Path, str]] = [
         (Path(__file__).parent / "config.yaml", "package"),
+        (_global_config_candidate(), "global"),
+        (Path.cwd() / "config.yaml", "cwd"),
     ]
+    merged = deepcopy(DEFAULT_CONFIG)
+    layers: list[tuple[str, Path]] = []
     for path, kind in candidates:
-        if not path.exists():
-            continue
-        try:
-            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            raise ValueError(f"Unable to load configuration {path}: {exc}") from exc
+        loaded = _read_layer(path)
         if loaded is None:
-            loaded = {}
-        if not isinstance(loaded, dict):
-            raise ValueError(f"Configuration {path} must contain a YAML mapping")
-        CONFIG_SOURCE = path.resolve()
-        CONFIG_SOURCE_KIND = kind
-        return _merge(DEFAULT_CONFIG, loaded)
-    CONFIG_SOURCE = None
-    CONFIG_SOURCE_KIND = "default"
-    return deepcopy(DEFAULT_CONFIG)
+            continue
+        if loaded:
+            merged = _merge(merged, loaded)
+        layers.append((kind, path.resolve()))
+    CONFIG_SOURCE_LAYERS = layers
+    if layers:
+        # The highest-precedence layer that said anything is the useful
+        # single-file answer, and matches what CONFIG_SOURCE always meant.
+        CONFIG_SOURCE_KIND, CONFIG_SOURCE = layers[-1]
+    else:
+        CONFIG_SOURCE = None
+        CONFIG_SOURCE_KIND = "default"
+    # Written through the module-level dict rather than only returned, so there is
+    # exactly one live configuration in the process. Returning a fresh copy while
+    # CONFIG kept the previous one let two readers disagree: a command that
+    # re-loaded could report one provider while the code that resolved the
+    # provider acted on another. A dozen modules hold a reference to CONFIG, so
+    # the update is in place.
+    CONFIG.clear()
+    CONFIG.update(merged)
+    return CONFIG
+
+
+def _global_config_candidate() -> Path:
+    """``~/.terminus/config.yaml``, resolved late so tests can move the home dir."""
+    from terminus.user_config import global_config_path
+
+    return global_config_path()
 
 
 CONFIG = load_config()

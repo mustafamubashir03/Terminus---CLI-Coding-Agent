@@ -14,22 +14,26 @@ from pathlib import Path
 
 from pydantic import BaseModel
 from terminus.observability.logging import get_logger
-from langchain.agents import create_agent
 from terminus.llm.factory import get_chat_model
 from terminus.llm.text import message_text
-from terminus.tools.codebase_tool import search_codebase
-from terminus.tools.terminal_tools import run_command,run_in_directory
-from terminus.skills.skill_tools import load_skill,build_skills_prompt
+from terminus.skills.skill_tools import build_skills_prompt
 from terminus.skills.matcher import detect_conflicts
 from terminus.skills.registry import MAX_SKILLS_PER_TASK, MAX_SKILLS_TOTAL_CHARS
 from terminus.project_context import plan_fields
 from terminus.mcp.terminus_mcp_client import get_terminus_mcp_tools
-from terminus.tools.filesystem_tools import list_directory,read_file,write_file,delete_file,file_exists,append_file
+from terminus.agents_md import agents_md_section, load_agents_md
+from terminus.tools import registry
+from terminus.context.environment import build_startup_context
+from terminus.agent.factory import AgentPolicy, build_agent, versioning_section
 from terminus.workspace import project_root
 
 from terminus.config import CONFIG
 from terminus.cache import get_cached_prompt, cache_prompt, retry_async
-from terminus.observability.usage_tracker import UsageCallbackHandler, record
+from terminus.observability.usage_tracker import (
+    ToolCallbackHandler,
+    UsageCallbackHandler,
+    record,
+)
 
 # Bounds for external operations. Every long-running call below is wrapped so a
 # hung provider/tool/agent cannot leave a task permanently IN_PROGRESS.
@@ -51,9 +55,10 @@ JUDGE_SYSTEM_PROMPT = (
     "criteria are actually satisfied by the output."
 )
 
-# Simple tools for agent
+_WORKER_MODEL_CALLS = 12
+"""Model calls one task attempt may make before the run ends."""
 
-_DEFAULT_TOOLS = [search_codebase]
+_DEFAULT_TOOL_NAMES = ("search_codebase",)
 
 # Code repository tools are read-only and are intentionally excluded (they are
 # suffix-aliased by GitHub's MCP ""_get_content" tool and slow down every
@@ -103,7 +108,14 @@ _CACHED_TOOLS: dict | None = None
 
 
 async def _tool_plans() -> dict:
-    """Build and cache the per-task-type tool lists for the process."""
+    """Build and cache the per-task-type tool lists for the process.
+
+    Which Terminus tools each task type gets is declared as *names* in
+    ``terminus.tools.registry``, the same catalogue /ask resolves through, so a
+    tool cannot exist for one surface and be silently missing from the other.
+    Only the MCP tools are genuinely dynamic, and they are appended after the
+    named ones.
+    """
     global _CACHED_TOOLS
     if _CACHED_TOOLS is not None:
         return _CACHED_TOOLS
@@ -111,15 +123,14 @@ async def _tool_plans() -> dict:
         get_terminus_mcp_tools(), timeout=_MCP_TOOLS_TIMEOUT_SECONDS
     )
     mcp_tools = _filter_github_code_read_tools(mcp_tools)
-    filesystem_tools = [list_directory, read_file, write_file, delete_file, file_exists, append_file]
 
     _CACHED_TOOLS = {
-        "design": _dedupe([*_DEFAULT_TOOLS, *filesystem_tools, load_skill]),
-        "implement": _dedupe([*_DEFAULT_TOOLS, *filesystem_tools, *mcp_tools, run_command, run_in_directory, load_skill]),
-        "test": _dedupe([*_DEFAULT_TOOLS, *filesystem_tools, *mcp_tools, run_command, run_in_directory]),
-        "review": _dedupe([*_DEFAULT_TOOLS, *filesystem_tools, load_skill]),
-        "integrate": _dedupe([*_DEFAULT_TOOLS, *filesystem_tools, *mcp_tools, run_command, run_in_directory]),
-        "configure": _dedupe([*_DEFAULT_TOOLS, *filesystem_tools, *mcp_tools, run_command, run_in_directory]),
+        task_type: _dedupe([
+            *registry.resolve(
+                (*_DEFAULT_TOOL_NAMES, *names), extra=mcp_tools
+            )
+        ])
+        for task_type, names in registry.PLAN_TOOL_NAMES.items()
     }
     return _CACHED_TOOLS
 
@@ -168,7 +179,7 @@ def _load_plan(project_id: str | None) -> dict | None:
 
 
 def _build_system_prompt(
-    task: dict, dep_outputs: list[dict], plan: dict | None = None
+    task: dict, dep_outputs: list[dict], plan: dict | None = None, tools: list | None = None
 ) -> str:
     prompt = "You are tasked with executing the following subtask:\n"
     prompt += f"Task Type: {task.get('task_type')}\n"
@@ -225,6 +236,40 @@ def _build_system_prompt(
         prompt += "\nHere are the results from dependencies that you must use:\n"
         for dep in dep_outputs:
             prompt += f"- Dependency Task {dep.get('id')}:\n{dep.get('result')}\n"
+    # The project own instructions. A worker writes files, so it is the agent
+    # most bound by them; it was also the one agent that never saw them, because
+    # it builds this prompt from scratch rather than reusing the /ask assembly.
+    workspace_notes = build_startup_context(project_root())
+    if workspace_notes:
+        prompt += "\n" + workspace_notes
+
+    # A /plan worker is the clearest case of the workspace being shared durable
+    # state rather than scratch: it writes files that a later task, a reviewer or
+    # a judge reads, and it reads files earlier tasks produced. One paragraph, and
+    # only the facts - every path it can reach is already enforced by
+    # terminus.workspace rather than by this sentence.
+    prompt += (
+        "\nPaths you pass to file tools are relative to that workspace, and a path "
+        "outside it is rejected. The workspace is shared and durable: earlier tasks "
+        "have already written into it, later tasks and the reviewer will read what "
+        "you write, and your own findings belong in files if they need to outlive "
+        "this attempt. Use '.terminus/notes/' for working notes rather than relying "
+        "on anything you cannot point at.\n"
+    )
+    # Version state a worker can read but not change. The section is derived from
+    # this worker's own tool list rather than written unconditionally, so a worker
+    # that somehow lost the git tools is never told it has them.
+    versioning = versioning_section(tools or ())
+    if versioning:
+        prompt += f"\n{versioning}\n"
+
+    # Durable knowledge from earlier sessions and earlier tasks in this same
+    # workspace. Read per task rather than cached: a worker that started from a
+    # stale copy would carry an outdated convention into files it is about to
+    # write, and the reviewer and judge read those files.
+    memory = agents_md_section(load_agents_md())
+    if memory:
+        prompt += f"\n{memory}\n"
 
     prompt += "\nEnsure you output exactly what is required to complete this task."
     return prompt
@@ -464,6 +509,23 @@ async def judge_task(task: dict, output: str, output_file_contents: str = "") ->
         f"Judge returned no structured verdict for task {task['id']}: {text[:200]!r}"
     )
 
+def _log_tool_activity(task_id, tools_seen) -> None:
+    """Report a worker's tool activity: what it touched, and what failed.
+
+    Read from the handler's records rather than from graph state, because the
+    records exist even when the stream raised before a final state arrived.
+    """
+    changed = tools_seen.files_changed()
+    if changed:
+        logger.info(
+            "Task %s touched workspace paths: %s", task_id, ", ".join(changed)
+        )
+    for failure in tools_seen.failures():
+        logger.warning(
+            "Task %s tool %s failed: %s", task_id, failure.name, failure.error
+        )
+
+
 async def _run_worker_agent(
     task: dict,
     dep_outputs: list[dict],
@@ -488,29 +550,31 @@ async def _run_worker_agent(
     model = model or CONFIG["llm"]["model"]
     task_id = task.get("id", "?")
 
-    llm = get_chat_model(model, model_provider=provider)
     tool_map = await _tool_plans()
-    tools = tool_map.get(task.get("task_type", ""), _DEFAULT_TOOLS)
+    tools = tool_map.get(
+        task.get("task_type", ""), list(registry.resolve(_DEFAULT_TOOL_NAMES))
+    )
 
-    system_prompt = _build_system_prompt(task, dep_outputs, _load_plan(task.get("project_id")))
+    system_prompt = _build_system_prompt(
+        task, dep_outputs, _load_plan(task.get("project_id")), tools
+    )
     system_prompt += _worker_selected_skills(task)
     if feedback:
         system_prompt += f"\n\nPrevious attempt feedback:\n{feedback}"
     system_prompt += _worker_skills_section(tools)
     logger.info("Building worker agent for task %s: %s", task_id, task.get("description"))
 
-    from langchain.agents.middleware import (
-        ModelCallLimitMiddleware,
-        ToolCallLimitMiddleware,
-    )
-
-    middlewares = [
-        ModelCallLimitMiddleware(run_limit=12, exit_behavior="end"),
-        ToolCallLimitMiddleware(tool_name="search_codebase", run_limit=4, exit_behavior="end"),
-        ToolCallLimitMiddleware(tool_name="write_file", run_limit=30, exit_behavior="end"),
-    ]
-    agent = create_agent(llm, tools=tools, system_prompt=system_prompt, middleware=middlewares)
-
+    agent = await build_agent(AgentPolicy(
+        tools=tuple(tools),
+        system_prompt=system_prompt,
+        model=model,
+        provider=provider,
+        model_call_limit=_WORKER_MODEL_CALLS,
+        tool_call_limits=(("search_codebase", 4), ("write_file", 30)),
+        tool_limit_behaviour="end",
+        summarize=False,
+        checkpoint=False,
+    ))
     output_files = _as_str_list(task.get("output_files"))
     user_message = (
         f"{task.get('description')}\n\n"
@@ -532,6 +596,10 @@ async def _run_worker_agent(
     )
 
     handler = UsageCallbackHandler(kind="executor")
+    # Tool observation rides the same config as usage. The framework's
+    # on_tool_* hooks see every call ToolNode makes, so a worker gets the same
+    # record of what it touched that /ask does, without a second execution path.
+    tools_seen = ToolCallbackHandler(kind="executor")
     initial_snapshot = _output_file_snapshot(output_files)
 
     async def _stream_agent():
@@ -539,7 +607,7 @@ async def _run_worker_agent(
         async for step in agent.astream(
             {"messages": [{"role": "user", "content": user_message}]},
             stream_mode="values",
-            config={"callbacks": [handler]},
+            config={"callbacks": [handler, tools_seen]},
         ):
             last_msg = step["messages"][-1]
             tool_calls = getattr(last_msg, "tool_calls", None)
@@ -569,6 +637,7 @@ async def _run_worker_agent(
         ) from None
     finally:
         record(handler.records, "executor")
+        _log_tool_activity(task_id, tools_seen)
     logger.info("Task %s: agent stream END", task_id)
 
     messages = final_state.get("messages", []) if final_state else []

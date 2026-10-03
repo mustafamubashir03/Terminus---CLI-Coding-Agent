@@ -26,9 +26,6 @@ import ssl
 from collections.abc import Iterator
 from enum import Enum
 
-from terminus.observability.logging import get_logger
-
-logger = get_logger(__name__)
 
 
 class IndexerError(RuntimeError):
@@ -70,19 +67,6 @@ class VectorStoreFailure(str, Enum):
     UNKNOWN = "unknown"
 
 
-#: A failure that means "this store is not usable right now", as opposed to a
-#: mistake in the request. Used to decide whether an *explicitly enabled*
-#: fallback is allowed to engage at all.
-RECOVERABLE_FAILURES = frozenset({
-    VectorStoreFailure.DNS,
-    VectorStoreFailure.CONNECTION_REFUSED,
-    VectorStoreFailure.TLS,
-    VectorStoreFailure.TIMEOUT,
-    VectorStoreFailure.UNAVAILABLE,
-    VectorStoreFailure.LOCAL_STORE,
-})
-
-
 def _exception_chain(exc: BaseException) -> Iterator[BaseException]:
     seen: set[int] = set()
     current: BaseException | None = exc
@@ -104,15 +88,6 @@ def root_cause(exc: BaseException) -> BaseException:
         if nxt is None or nxt is current:
             return current
         current = nxt
-
-
-def is_transport_error(exc: BaseException) -> bool:
-    """True when the chain contains a connection/timeout style failure.
-
-    Kept for compatibility with the existing predicate. Prefer
-    :func:`classify_failure`, which distinguishes the cases this folds together.
-    """
-    return classify_failure(exc) in RECOVERABLE_FAILURES
 
 
 def classify_failure(exc: BaseException) -> VectorStoreFailure:

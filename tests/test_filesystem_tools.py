@@ -2,7 +2,10 @@
 
 Mutation tests all operate inside pytest's tmp_path so no real project file is
 touched. They install a policy that allows writes explicitly, so they do not
-depend on which policy another test file happened to leave installed.
+depend on which policy another test file happened to leave installed, and they
+point the workspace at tmp_path so the containment check treats those paths as
+inside the workspace - which is the same thing a real run does for a real
+workspace.
 """
 
 from pathlib import Path
@@ -16,6 +19,13 @@ from terminus.permissions import (
     set_permission_policy,
 )
 from terminus.tools.filesystem_tools import edit_file, write_file
+
+
+@pytest.fixture(autouse=True)
+def workspace(tmp_path, monkeypatch):
+    """tmp_path is the workspace for every test in this file."""
+    monkeypatch.setenv("TERMINUS_WORKSPACE", str(tmp_path))
+    return tmp_path
 
 
 @pytest.fixture(autouse=True)

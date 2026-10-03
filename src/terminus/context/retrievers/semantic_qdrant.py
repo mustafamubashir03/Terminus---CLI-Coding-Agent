@@ -10,7 +10,6 @@ size as its Chroma counterpart.
 
 from __future__ import annotations
 
-from terminus.context import retrievers
 from terminus.context.qdrant_scope import project_filter
 from terminus.context.retrievers.cache import cached_store
 from terminus.context.retrievers.retrieved import RetrievedChunk
@@ -42,8 +41,3 @@ def retrieve(query: str, k: int = 5) -> list[RetrievedChunk]:
     ]
     logger.info("Retrieved %d dense chunk(s) for query: %s", len(chunks), query)
     return chunks
-
-
-def reset_cache() -> None:
-    """Drop cached retrieval resources. See :func:`retrievers.cache.reset`."""
-    retrievers.cache.reset()

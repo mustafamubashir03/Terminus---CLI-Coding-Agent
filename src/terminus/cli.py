@@ -19,14 +19,8 @@ the rest.
 import asyncio
 from pathlib import Path
 from rich.console import Console
-from terminus.context.indexers.factory import get_or_create_index
 from terminus.env import load_project_env
-from terminus.llm.factory import (
-    aclose_llm_clients,
-    format_provider_diagnostics,
-    get_embedder,
-    get_llm,
-)
+from terminus.llm.factory import aclose_llm_clients, format_provider_diagnostics
 from terminus.observability.logging import get_logger
 
 console = Console()
@@ -107,23 +101,74 @@ def show_index_migration(rebuild_shared_collection: bool = False):
 
 
 def initialize():
+    """Prepare the process for a session, and return nothing expensive.
+
+    Startup deliberately does *not* build a chat client, load an embedding model
+    or open the vector store. Each of those is slow - a HuggingFace embedder
+    loads weights, a remote store costs a network round trip, a provider SDK
+    costs seconds of import time - and none of them is needed to accept the
+    first question. Opening a session should be as cheap as reading a prompt.
+
+    The pieces that genuinely must happen up front are the ones that are cheap
+    and that would otherwise fail later and further from the cause: loading the
+    project's ``.env``, resolving configuration, and checking that the
+    configured vector provider/mode pair is one that can work at all. That last
+    check is pure string validation, so a typo is still an immediate error rather
+    than a confusing failure from inside a storage client.
+
+    Everything expensive is built on first use by the code that needs it: the
+    chat client by :mod:`terminus.llm.factory`, the embedder and store by the
+    retriever the ``search_codebase`` tool calls.
+
+    Returns the resolved vector-store description, which needs no I/O and is what
+    the caller reports at startup.
+    """
+    from terminus.context.indexers.factory import configured, resolved_backend, validate
+    from terminus.observability.logging import configure_tracing
+
     logger.info("Initializing Terminus...")
     repo_path = Path.cwd()
     # A project .env is optional: it is searched for in parent directories, and a
     # missing file is not fatal because credentials may already be in the process
     # environment (CI, containers, an exported shell).
     load_project_env(repo_path)
-    llm = get_llm()
-    embedder = get_embedder()
-    # The resolution is kept so the REPL and the CLI can report which backend
-    # actually answered, including the case where an explicitly enabled fallback
-    # substituted one. The index itself is unchanged.
-    index, resolution = get_or_create_index(repo_path)
-    if resolution.fallback:
-        console.print(f"[bold yellow]{resolution.describe()}[/bold yellow]")
-    else:
-        logger.info("Terminus initialized successfully: %s", resolution.describe())
-    return llm, embedder, index, resolution
+
+    # If exactly one provider has a key and the configured one does not, use it.
+    # Done here rather than at config-import time because this is the first point
+    # where the project's .env has been read, and a key that is sitting in a file
+    # is a key the user has already provided. Making them run setup to connect
+    # the two was a configuration ritual with no decision in it.
+    try:
+        from terminus.user_config import apply_auto_provider
+
+        chosen = apply_auto_provider()
+    except Exception:  # never let convenience break startup
+        chosen = None
+    if chosen:
+        # Plain text: print() does not interpret Rich markup, so "[dim]...[/dim]"
+        # would reach the terminal as literal brackets.
+        logger.info("Auto-selected provider: %s", chosen)
+        print(chosen)
+
+    # Fail fast on a vector configuration that cannot work, without touching the
+    # network or the disk.
+    provider, mode = configured()
+    validate(provider, mode)
+    resolution = resolved_backend(provider, mode)
+
+    # Tracing is reconciled last, deliberately. Its job is to guarantee nothing in
+    # this process is traced, and it works by removing the variables LangChain
+    # reads - so running it before the steps above was running it too early:
+    # resolving the store re-reads the project's .env to find the cluster
+    # endpoint, which put back every variable just removed, LANGSMITH_TRACING
+    # included. Nothing above traces anything, so there is nothing to protect by
+    # doing it sooner, and doing it last is the only order a later import cannot
+    # undo.
+    if configure_tracing():
+        logger.info("LangSmith tracing enabled by configuration")
+
+    logger.info("Terminus initialized successfully: %s", resolution.describe())
+    return resolution
 
 
 def format_startup_error(exc: BaseException) -> str:

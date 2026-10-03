@@ -1,4 +1,4 @@
-"""Token usage + prompt-caching telemetry.
+"""Token usage + prompt-caching telemetry, and tool-call observation.
 
 Every LLM call in the process is routed through langchain callbacks, so a
 single ``BaseCallbackHandler`` hunched over ``on_llm_end`` can record
@@ -11,6 +11,17 @@ The accumulator lets us report, per session / plan run:
 
 Costs are estimated with standard OpenAI pricing so "did caching actually
 save money" is answered in concrete numbers.
+
+The same callbacks are how tool execution is observed. ``ToolCallbackHandler``
+implements the framework's ``on_tool_start`` / ``on_tool_end`` / ``on_tool_error``
+hooks rather than inventing an interception point, so it sees every tool call
+LangGraph's ``ToolNode`` makes with no second dispatch path and nothing to keep
+in step with the graph. LangChain hands each callback its own ``run_id`` and the
+``parent_run_id`` it was invoked under, so a tool execution is already correlatable
+with the model call that asked for it; both are recorded.
+
+Nothing here executes a tool, resolves a tool name, or decides what a tool
+returned. That is ``ToolNode``'s job and it stays there.
 """
 
 from __future__ import annotations
@@ -27,16 +38,14 @@ from terminus.tasks.errors import classify_failure
 
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Storage
-# ---------------------------------------------------------------------------
-
 
 @dataclass
 class CallRecord:
     model: str = ""
     provider: str = ""
     kind: str = ""  # "ask" | "plan" | "executor" | "judge" | "planner" | "summarize" | "other"
+    run_id: str = ""
+    """The framework run id of this model call, so a turn can be traced."""
     started: float = 0.0
     finished: float = 0.0
     error_category: str = ""
@@ -50,6 +59,98 @@ class CallRecord:
     @property
     def billed_input_tokens(self) -> int:
         return max(0, self.input_tokens - self.cached_tokens)
+
+
+#: How much of a tool's arguments a record keeps. Enough to say which file was
+#: touched; not enough to persist a file's whole contents into telemetry.
+_MAX_RECORDED_ARGS_CHARS = 400
+
+
+@dataclass
+class ToolRecord:
+    """One tool call: what was asked, what happened, and how long it took.
+
+    ``status`` distinguishes the three outcomes the model and the harness must
+    be able to tell apart, using LangChain's own vocabulary rather than a
+    Terminus-specific one:
+
+    * ``success`` - the tool ran and returned a result. Note that a tool which
+      *reports* a refusal as its result (``"Refused: ..."``) is still
+      ``success``: it ran, and its result was that string.
+    * ``error``   - the call was rejected or failed. LangGraph's ``ToolNode``
+      turns a raised exception into a ``ToolMessage`` with
+      ``status="error"``; this is that case, including a workspace violation.
+    * ``cancelled`` - the run stopped before the tool finished.
+    """
+
+    name: str = ""
+    tool_call_id: str = ""
+    args: dict[str, Any] = field(default_factory=dict)
+    status: str = "success"
+    """One of "success" | "error" | "cancelled"."""
+    started: float = 0.0
+    finished: float = 0.0
+    duration_seconds: float = 0.0
+    result: str = ""
+    error: str = ""
+    run_id: str = ""
+    parent_run_id: str = ""
+    mutated_paths: list[str] = field(default_factory=list)
+    """Workspace-relative paths this call *named*, if it was a mutating one.
+
+    Derived from the tool's own name and arguments rather than tracked
+    separately, because a tool that mutates the filesystem already says which
+    path it touched - and a second bookkeeping path could only ever disagree
+    with it.
+
+    Naming a path is not the same as changing it: a refused or deferred mutation
+    names one and touches none. :meth:`ToolCallbackHandler.files_changed` is the
+    answer to "what actually changed"; this is the answer to "what was aimed at".
+    """
+
+    @property
+    def performed(self) -> bool:
+        """Did this call change the workspace, as opposed to naming a path?
+
+        False for a rejected call, and for a mutating call the permission guard
+        declined. Both are decided by the guard that produced the wording, not
+        re-guessed here.
+        """
+        from terminus.coordination import was_performed
+
+        return self.ok and was_performed(self.result)
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "success"
+
+
+#: Tools that change the workspace, and the argument naming the path they change.
+#: Deliberately a plain table next to the record, not a registry concern: the
+#: registry knows which tools exist, this knows which of them write.
+#:
+#: ``git_commit`` and ``git_branch`` are absent even though both change repository
+#: state, because this table answers a narrower question: which *files* did the
+#: call change. A commit records the tree as it already is and a branch creates a
+#: ref; neither rewrites a file, so claiming a path for them would report work
+#: that did not happen. ``git_checkout`` does rewrite the working tree, so it is
+#: here. The harness's own mutated/observed signal lives in
+#: ``agent.orchestrator`` and covers all three.
+_MUTATING_TOOL_PATH_ARGS: dict[str, str] = {
+    "write_file": "file_path",
+    "edit_file": "file_path",
+    "append_file": "file_path",
+    "delete_file": "file_path",
+    "run_command": "working_directory",
+    "run_shell_command": None,
+    "run_command_in_directory": "directory",
+}
+
+#: Mutating tools whose damage is the workspace itself rather than one argument
+#: naming a path. Listed separately so the path table above keeps meaning "the
+#: argument that names what changed".
+_WHOLE_WORKSPACE_TOOLS = frozenset({"run_shell_command", "run_command_in_directory", "git_checkout"})
+
 
 
 @dataclass
@@ -173,24 +274,29 @@ def estimate_cost(billed_input_tokens: int, output_tokens: int, model: str = "")
     return (billed_input_tokens / 1_000_000) * in_price + (output_tokens / 1_000_000) * out_price
 
 
-# ---------------------------------------------------------------------------
-# Callback handler
-# ---------------------------------------------------------------------------
-
-
 class UsageCallbackHandler(BaseCallbackHandler):
     """Record token usage + prompt-cache hits from every completed LLM run."""
 
-    def __init__(self, kind: str = "other"):
+    def __init__(self, kind: str = "other", run_id: str = ""):
         self.kind = kind
+        self.run_id = run_id
+        """Optional caller-supplied id for the whole execution.
+
+        LangChain already assigns every run its own id and parents tool runs
+        under the model run that requested them, so correlation works without
+        this. It exists so one *execution* - one /ask turn, one worker attempt,
+        one child - can be named and found in the logs, rather than only a
+        chain of anonymous ids.
+        """
         self.records: list[CallRecord] = []
         self._started: float | None = None
+        self._last_run_id: str = ""
 
     def on_llm_start(
         self, serialized: dict[str, Any], prompts: list[str], **kwargs: Any
     ) -> None:
         self._started = time.perf_counter()
-
+        self._last_run_id = str(kwargs.get("run_id") or "")
     def _extract_usage(self, response: Any) -> tuple[int, int, int, str]:
         """Return (input_tokens, output_tokens, cached_tokens, model)."""
         model = ""
@@ -291,6 +397,7 @@ class UsageCallbackHandler(BaseCallbackHandler):
             model=model,
             provider=provider,
             kind=self.kind,
+            run_id=str(kwargs.get("run_id") or self._last_run_id or ""),
             started=self._started or 0.0,
             finished=finished,
             latency_seconds=max(0.0, finished - self._started)
@@ -319,6 +426,7 @@ class UsageCallbackHandler(BaseCallbackHandler):
                 model=model,
                 provider=provider,
                 kind=self.kind,
+                run_id=str(kwargs.get("run_id") or self._last_run_id or ""),
                 started=self._started or 0.0,
                 finished=finished,
                 latency_seconds=max(0.0, finished - self._started)
@@ -333,6 +441,198 @@ class UsageCallbackHandler(BaseCallbackHandler):
 
     def flush(self) -> list[CallRecord]:
         return self.records
+
+
+def _bounded_args(args: Any) -> dict[str, Any]:
+    """Tool arguments, truncated so telemetry cannot become a content store.
+
+    A file path, a pattern and a command are what matter. A 40 KB blob of
+    generated source passed as ``content`` is not, and must not end up in a
+    process-lifetime log.
+    """
+    if not isinstance(args, dict):
+        return {}
+    bounded: dict[str, Any] = {}
+    for key, value in args.items():
+        text = value if isinstance(value, str) else str(value)
+        if len(text) > _MAX_RECORDED_ARGS_CHARS:
+            text = f"{text[:_MAX_RECORDED_ARGS_CHARS]}...[truncated]"
+        bounded[str(key)] = text
+    return bounded
+
+
+def _parse_inputs(input_str: str) -> Any:
+    """Recover arguments from the string form, when ``inputs`` was not supplied.
+
+    ``on_tool_start`` is given both; this is only reached if a provider or
+    wrapper collapses them, and a string is still better than losing the record.
+    """
+    import json
+
+    try:
+        return json.loads(input_str)
+    except (TypeError, ValueError):
+        return {}
+
+
+def mutated_paths(name: str, args: Any) -> list[str]:
+    """Workspace paths a tool call *aims at*, relative to the workspace.
+
+    A pure function of the tool's name and arguments, so the answer is the same
+    whether it is asked before or after the call ran, and a caller that wants to
+    know what a call touched does not need to have been listening. Whether the
+    call actually changed them is a separate question - see
+    :attr:`ToolRecord.performed`.
+    """
+    if not isinstance(args, dict):
+        return []
+    if name in _MUTATING_TOOL_PATH_ARGS:
+        raw = args.get("working_directory") if name == "run_command" else args.get(
+            _MUTATING_TOOL_PATH_ARGS[name] or ""
+        )
+        if raw and str(raw).strip():
+            from terminus.workspace import relative_to_workspace
+
+            return [relative_to_workspace(str(raw))]
+        return []
+    if name in _WHOLE_WORKSPACE_TOOLS:
+        from terminus.workspace import project_root, relative_to_workspace
+
+        raw = args.get("directory")
+        return [relative_to_workspace(str(raw)) if raw else relative_to_workspace(
+            project_root()
+        )]
+    return []
+
+
+class ToolCallbackHandler(BaseCallbackHandler):
+    """Observe every tool call LangGraph executes, through framework callbacks.
+
+    This is observation and nothing else. It resolves no tool name, executes no
+    tool and rewrites no result: ``ToolNode`` already does all three, and a second
+    path to any of them is a second thing that can be wrong.
+
+    Instances are per-execution. Records live on the handler, so the caller that
+    created it - an /ask turn, a worker attempt, a child agent - reads its own
+    tool activity directly and correlates it with its own usage records through
+    the shared ``kind``.
+    """
+
+    def __init__(self, kind: str = "other") -> None:
+        self.kind = kind
+        self.records: list[ToolRecord] = []
+        self._pending: dict[str, ToolRecord] = {}
+
+    def on_tool_start(
+        self,
+        serialized: dict[str, Any],
+        input_str: str,
+        **kwargs: Any,
+    ) -> None:
+        # LangChain puts the tool's name in `serialized` and the parsed arguments
+        # in `inputs`; `name` arrives as None and `input` is not passed at all.
+        run_id = str(kwargs.get("run_id") or "")
+        name = str((serialized or {}).get("name") or kwargs.get("name") or "")
+        args = kwargs.get("inputs")
+        if not isinstance(args, dict):
+            args = _parse_inputs(input_str)
+        rec = ToolRecord(
+            name=name,
+            tool_call_id=str(kwargs.get("tool_call_id") or ""),
+            args=_bounded_args(args),
+            started=time.perf_counter(),
+            run_id=run_id,
+            parent_run_id=str(kwargs.get("parent_run_id") or ""),
+        )
+        rec.mutated_paths = mutated_paths(rec.name, rec.args)
+        self._pending[run_id] = rec
+
+    def on_tool_end(self, output: Any, **kwargs: Any) -> None:
+        rec = self._take(kwargs)
+        if rec is None:
+            return
+        rec.finished = time.perf_counter()
+        rec.duration_seconds = max(0.0, rec.finished - rec.started)
+        rec.result = _bounded_result(output)
+        # A tool that raised and had handle_tool_error set does not reach
+        # on_tool_error: BaseTool.run turns it into the tool's result with
+        # status="error" and reports a normal end. Reading the status is how one
+        # observable channel covers both ways a tool can fail.
+        if getattr(output, "status", None) == "error":
+            rec.status = "error"
+            rec.error = rec.result or "tool call failed"
+        else:
+            rec.status = "success"
+        self.records.append(rec)
+
+    def on_tool_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: Any = None,
+        **kwargs: Any,
+    ) -> None:
+        rec = self._take({**kwargs, "run_id": run_id})
+        if rec is None:
+            return
+        rec.finished = time.perf_counter()
+        rec.duration_seconds = max(0.0, rec.finished - rec.started)
+        rec.status = "error"
+        failure = classify_failure(error)
+        rec.error = f"{type(error).__name__}: {error}"[:_MAX_RECORDED_ARGS_CHARS]
+        if failure.category:
+            rec.error = f"{rec.error} [{failure.category}]"
+        self.records.append(rec)
+
+    def _take(self, kwargs: dict[str, Any]) -> ToolRecord | None:
+        rec = self._pending.pop(str(kwargs.get("run_id") or ""), None)
+        if rec is None and self._pending:
+            # A callback that reached us without the id we keyed on still belongs
+            # to the call in flight; dropping it would lose the only record of a
+            # tool that failed.
+            rec = self._pending.pop(next(iter(self._pending)))
+        return rec
+
+    def flush(self) -> list[ToolRecord]:
+        return self.records
+
+    def files_changed(self) -> list[str]:
+        """Workspace paths a mutating call actually changed, in first-seen order.
+
+        Excludes anything the permission guard declined. A refused write names a
+        path and changes nothing, and a harness that reported it as changed would
+        go looking for a verification that cannot exist.
+        """
+        seen: list[str] = []
+        for rec in self.records:
+            if not rec.performed:
+                continue
+            for path in rec.mutated_paths:
+                if path not in seen:
+                    seen.append(path)
+        return seen
+
+    def failures(self) -> list[ToolRecord]:
+        return [r for r in self.records if not r.ok]
+
+
+def _bounded_result(output: Any) -> str:
+    """A tool's result, as text and truncated to the same bound as its arguments.
+
+    ``ToolMessage`` and ``Command`` outputs are read through ``content`` rather
+    than ``repr``, because what the model actually read is the thing worth
+    recording.
+    """
+    content = getattr(output, "content", None)
+    if content is None and hasattr(output, "messages"):
+        messages = getattr(output, "messages", None) or []
+        content = getattr(messages[-1], "content", "") if messages else ""
+    if content is None:
+        content = output if isinstance(output, str) else str(output)
+    text = content if isinstance(content, str) else str(content)
+    if len(text) > _MAX_RECORDED_ARGS_CHARS:
+        return f"{text[:_MAX_RECORDED_ARGS_CHARS]}...[truncated]"
+    return text
 
 
 _global_summary = UsageSummary()

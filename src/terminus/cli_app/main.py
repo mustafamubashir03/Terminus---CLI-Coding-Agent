@@ -38,8 +38,7 @@ app = typer.Typer(
     help=(
         "Terminus - a multi-agent coding assistant.\n\n"
         "Run [bold]terminus[/bold] with no arguments to open the interactive session, "
-        "or [bold]terminus agent -p 'your prompt'[/bold] to run one prompt and exit."
-    ),
+        "or [bold]terminus agent -p 'your prompt'[/bold] to run one prompt and exit."    ),
     add_completion=True,
     no_args_is_help=False,
     rich_markup_mode="rich",
@@ -59,10 +58,17 @@ def _register() -> None:
         tools_app,
     )
     from terminus.cli_app.provider_commands import models_app, providers_app
+    from terminus.cli_app.setup import doctor_app, setup_app
 
     # Names are explicit. Typer 0.27 warns that add_typer without a name drops
     # the sub-app callback, which flattens every leaf command onto the root.
+    #
+    # `setup` and `doctor` are registered first and are plain commands rather than
+    # groups: they are what a user with no configuration needs, so they must not
+    # be buried behind a subcommand they have to know the name of.
     for name, sub in (
+        ("setup", setup_app),
+        ("doctor", doctor_app),
         ("agent", agent_app),
         ("providers", providers_app),
         ("models", models_app),
@@ -90,7 +96,18 @@ def root(
         help="Show the version and exit.",
     ),
     json_output: bool = typer.Option(False, "--json", help="Make the current command emit JSON."),
-    log_level: str = typer.Option("INFO", "--log-level", help="Log level: DEBUG, INFO, WARNING, ERROR."),
+    dev: bool = typer.Option(
+        False, "--dev",
+        help="Turn on full diagnostic logging: every provider attempt, every "
+             "fallback decision, and third-party request logs. Equivalent to "
+             "--log-level DEBUG. Intended for reporting a problem, not for "
+             "normal use - the output is very noisy.",
+    ),
+    log_level: str = typer.Option(
+        "WARNING", "--log-level",
+        help="Log level: DEBUG, INFO, WARNING, ERROR. Defaults to WARNING; "
+             "DEBUG also enables third-party request logging.",
+    ),
 ) -> None:
     """Terminus - a multi-agent coding assistant.
 
@@ -100,20 +117,30 @@ def root(
     """
     import os
 
+    from terminus.config import load_config
     from terminus.observability.logging import set_log_level
+
+    # Re-resolve configuration against the directory this command was run from.
+    # CONFIG is populated once at import, which is the right answer for whatever
+    # directory the process started in and the wrong one here: the project layer
+    # is cwd-relative, so a command (or a test) that has moved must not be
+    # answered from the import-time location. load_config() updates CONFIG in
+    # place, so every module already holding a reference sees the current answer.
+    load_config()
 
     ctx.obj = {"json": json_output}
     formatting.set_force_json(json_output)
-    os.environ.setdefault("TERMINUS_LOG_LEVEL", log_level.upper())
-    set_log_level(log_level)
+    # --dev is a named thing people reach for when something is wrong, so it wins
+    # over an explicitly-given --log-level rather than fighting it.
+    effective = "DEBUG" if dev else log_level
+    os.environ.setdefault("TERMINUS_LOG_LEVEL", effective.upper())
+    set_log_level(effective)
 
     if ctx.invoked_subcommand is not None:
         return
-    formatting.console.print(
-        f"[bold blue]Terminus[/bold blue] {_version()}  "
-        f"[dim]Run [cyan]terminus --help[/cyan] for commands, "
-        f"or [cyan]terminus agent[/cyan] to start the session.[/dim]"
-    )
+    # No second banner here. The session prints its own header the moment it
+    # starts, and telling someone who just typed `terminus` to "run terminus
+    # agent to start the session" is telling them to do what they already did.
     raise typer.Exit(code=formatting.launch_repl())
 
 

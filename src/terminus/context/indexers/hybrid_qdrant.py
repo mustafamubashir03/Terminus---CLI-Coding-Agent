@@ -107,7 +107,11 @@ def get_or_create_qdrant_hybrid_index(repo_path: str, *, force_reindex: bool = F
             documents.append(Document(page_content=chunk.content, metadata=chunk_metadata(chunk)))
 
     store = write_documents(
-        client, documents, name, sparse_embedding=sparse_retriever()
+        client,
+        documents,
+        name,
+        sparse_embedding=sparse_retriever(),
+        retrieval_mode=retrieval_mode(),
     )
     from terminus.context.indexers.freshness import Manifest, _now_iso
 

@@ -486,7 +486,7 @@ def test_locks_are_reused_not_leaked(allow_write):
 # ---------------------------------------------------------------------------
 
 
-def test_write_file_holds_lock_across_the_write(allow_write, monkeypatch, tmp_path):
+def test_write_file_holds_lock_across_the_write(allow_write, monkeypatch, tmp_path, workspace):
     """A second writer cannot land inside another writer's critical section."""
     from terminus.tools import filesystem_tools as fs
 
@@ -526,7 +526,7 @@ def test_write_file_holds_lock_across_the_write(allow_write, monkeypatch, tmp_pa
     assert "written successfully" in results["b"]
 
 
-def test_append_file_is_authorised(allow_write, tmp_path):
+def test_append_file_is_authorised(allow_write, tmp_path, workspace):
     """Regression: append was a /plan-only tool that bypassed policy entirely."""
     from terminus.tools import filesystem_tools as fs
 
@@ -548,7 +548,7 @@ def test_append_file_is_authorised(allow_write, tmp_path):
     assert target.read_text(encoding="utf-8") == "ab"
 
 
-def test_delete_file_is_authorised_as_destructive(allow_write, tmp_path):
+def test_delete_file_is_authorised_as_destructive(allow_write, tmp_path, workspace):
     """Regression: delete was unauthorised, and is DESTRUCTIVE when governed."""
     from terminus.tools import filesystem_tools as fs
 
@@ -581,7 +581,7 @@ def test_delete_file_is_authorised_as_destructive(allow_write, tmp_path):
     assert not target.exists()
 
 
-def test_read_only_tools_still_work_under_a_busy_writer(allow_write, tmp_path):
+def test_read_only_tools_still_work_under_a_busy_writer(allow_write, tmp_path, workspace):
     from terminus.tools import filesystem_tools as fs
 
     target = tmp_path / "data.txt"

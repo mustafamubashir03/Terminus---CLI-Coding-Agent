@@ -40,19 +40,30 @@ from terminus.llm.providers import credential_env_names
 #: disagree with each other about which providers exist.
 ENV_KEYS = credential_env_names()
 
-SECRET_MASK = "********"
 
-
-def config_path() -> Path:
+def config_path(scope: str = "project") -> Path:
     """The configuration file a write should go to.
 
-    Always the current directory's ``config.yaml``, which is exactly the file
+    ``scope="project"`` (the default) is the current directory's
+    ``config.yaml``, which is exactly the file
     :func:`terminus.config.load_config` looks for first. Resolving it from the
     import-time ``CONFIG_SOURCE`` instead would send a write to whatever
     directory the process happened to start in, which is a surprising place to
     find your configuration edited.
+
+    ``scope="global"`` writes ``~/.terminus/config.yaml``, which sits *below* the
+    project file in the load order. So a global default is what you get in a new
+    repository, and a repository that needs something different says so
+    explicitly - the relationship a user expects, rather than the global file
+    silently winning.
     """
-    return Path.cwd() / "config.yaml"
+    if scope == "global":
+        from terminus.user_config import global_config_path
+
+        return global_config_path()
+    if scope == "project":
+        return Path.cwd() / "config.yaml"
+    raise ValueError(f"unknown config scope: {scope!r}")
 
 
 PLAIN_SCALAR = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./:@+=-]*$")
@@ -103,7 +114,7 @@ def _find_key(lines: list[str], parts: list[str]) -> int | None:
     return None
 
 
-def set_value(dotted: str, value: Any) -> tuple[Path, Any]:
+def set_value(dotted: str, value: Any, scope: str = "project") -> tuple[Path, Any]:
     """Persist ``dotted=value`` into the configuration file.
 
     Edits the one line in place rather than re-serialising the document.
@@ -121,7 +132,7 @@ def set_value(dotted: str, value: Any) -> tuple[Path, Any]:
     if isinstance(value, (dict, list)):
         raise TypeError(f"{dotted} must be a scalar, not a {type(value).__name__}")
 
-    path = config_path()
+    path = config_path(scope)
     path.parent.mkdir(parents=True, exist_ok=True)
     text = path.read_text(encoding="utf-8") if path.exists() else ""
     lines = text.splitlines()
@@ -159,6 +170,47 @@ def set_value(dotted: str, value: Any) -> tuple[Path, Any]:
         raise ValueError(f"Refusing to write a config file that would not parse: {exc}") from exc
     path.write_text(updated, encoding="utf-8")
     return path, value
+
+
+def unset_value(dotted: str, scope: str = "project") -> tuple[Path, bool]:
+    """Remove ``dotted`` from one config file. Returns the file and whether it was there.
+
+    Removing a key only does something if that file actually sets it: that is how
+    a project stops overriding a global default. It refuses to invent a parent
+    section, and leaves the file untouched when the key is absent.
+    """
+    path = config_path(scope)
+    if not path.exists():
+        return path, False
+    lines = path.read_text(encoding="utf-8").splitlines()
+    parts = dotted.split(".")
+    index = _find_key(lines, parts)
+    if index is None:
+        return path, False
+    del lines[index]
+    # Drop a parent section that just lost its last key. Leaving a bare "llm:"
+    # behind is not merely untidy: it reads as a null override, and a file that
+    # only ever empties out is a file that slowly loses everything it was
+    # inheriting.
+    for depth in range(len(parts) - 1, 0, -1):
+        parent = _find_key(lines, parts[:depth])
+        if parent is None:
+            break
+        indent = len(lines[parent]) - len(lines[parent].lstrip())
+        if any(
+            line.strip() and (len(line) - len(line.lstrip())) > indent
+            for line in lines[parent + 1 :]
+        ):
+            break
+        del lines[parent]
+    updated = "\n".join(lines).rstrip() + "\n"
+    # Same guard as set_value: never leave a file that the next run cannot read.
+    try:
+        yaml.safe_load(updated)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Refusing to write a config file that would not parse: {exc}") from exc
+    path.write_text(updated, encoding="utf-8")
+    return path, True
 
 
 def get_value(dotted: str) -> Any:
@@ -202,9 +254,6 @@ def _has_path(document: Any, dotted: str) -> bool:
     return True
 
 
-# --- credentials -----------------------------------------------------------
-
-
 def credentials_file() -> Path:
     """Where ``providers login`` writes a key.
 
@@ -214,35 +263,6 @@ def credentials_file() -> Path:
     ``config.yaml``, which people commit.
     """
     return Path.cwd() / ".env"
-
-
-def store_credential(env_key: str, value: str, *, to_stdout: bool = False) -> Path:
-    """Write ``ENV_KEY=value`` into the ``.env`` file, replacing any existing entry."""
-    path = credentials_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    existing = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-    pattern = re.compile(rf"^\s*{re.escape(env_key)}\s*=")
-    lines = [line for line in existing if not pattern.match(line)]
-    lines.append(f"{env_key}={value}")
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-    if to_stdout:
-        os.environ[env_key] = value
-    return path
-
-
-def clear_credential(env_key: str) -> tuple[Path, bool]:
-    """Remove a key from the ``.env`` file. Returns the file and whether it was there."""
-    path = credentials_file()
-    if not path.exists():
-        return path, False
-    pattern = re.compile(rf"^\s*{re.escape(env_key)}\s*=")
-    existing = path.read_text(encoding="utf-8").splitlines()
-    kept = [line for line in existing if not pattern.match(line)]
-    removed = len(kept) != len(existing)
-    if removed:
-        path.write_text("\n".join(kept).rstrip() + "\n", encoding="utf-8")
-        os.environ.pop(env_key, None)
-    return path, removed
 
 
 def credential_status() -> list[dict[str, Any]]:
@@ -262,7 +282,3 @@ def _in_env_file(key: str) -> bool:
     if not path.exists():
         return False
     return any(re.match(rf"^\s*{re.escape(key)}\s*=", line) for line in path.read_text(encoding="utf-8").splitlines())
-
-
-def mask(value: str) -> str:
-    return SECRET_MASK if value else ""

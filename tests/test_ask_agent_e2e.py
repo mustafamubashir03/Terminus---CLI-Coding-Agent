@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sys
 
+import pytest
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
 from langchain.agents.middleware import ToolCallLimitMiddleware
@@ -26,6 +27,18 @@ from terminus.permissions import PermissionLevel, PermissionPolicy
 from terminus.tools import shell_tools
 
 PY = sys.executable
+
+
+@pytest.fixture(autouse=True)
+def workspace(tmp_path, monkeypatch):
+    """tmp_path is the workspace, so the scripted absolute paths are inside it.
+
+    Tools resolve paths when they are called, not when the graph is built, so
+    this has to hold for the whole test rather than for the duration of
+    ``build()``.
+    """
+    monkeypatch.setenv("TERMINUS_WORKSPACE", str(tmp_path))
+    return tmp_path
 
 
 def tool_call(name: str, args: dict, call_id: str) -> AIMessage:
@@ -70,7 +83,12 @@ class ScriptedModel(GenericFakeChatModel):
 
 
 def build(script, tmp_path, *, approve_writes: bool = True, tool_limit: int = 40):
-    """Assemble a real /ask graph around a scripted model."""
+    """Assemble a real /ask graph around a scripted model.
+
+    The workspace is set by the autouse ``workspace`` fixture rather than here,
+    because the graph is *invoked* after this returns and the tools resolve
+    their paths at call time.
+    """
     auto = (
         (PermissionLevel.READ_ONLY, PermissionLevel.WRITE)
         if approve_writes
@@ -265,17 +283,15 @@ def test_global_tool_budget_stops_a_runaway_loop_but_still_answers(tmp_path, mon
     script = tmp_path / "ping.py"
     script.write_text("print('x')\n", encoding="utf-8")
 
-    # Count what actually reached the operating system. The summarisation
+# Count what actually reached the operating system. The summarisation
     # middleware can compact the message history, so counting ToolMessages after
     # the fact is not reliable.
-    real_run = shell_tools.subprocess.run
+    real_spawn = shell_tools._spawn
     spawned: list[str] = []
-
-    def counting_run(command, **kwargs):
+    def counting_spawn(command, cwd):
         spawned.append(command)
-        return real_run(command, **kwargs)
-
-    monkeypatch.setattr(shell_tools.subprocess, "run", counting_run)
+        return real_spawn(command, cwd)
+    monkeypatch.setattr(shell_tools, "_spawn", counting_spawn)
 
     # a model that never stops asking (unique ids, as a real model would produce)
     loop = [tool_call("run_command", {

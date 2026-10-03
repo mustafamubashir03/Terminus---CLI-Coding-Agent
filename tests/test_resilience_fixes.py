@@ -134,7 +134,7 @@ def test_unknown_skill_does_not_raise(monkeypatch):
 # encoding: read_file is UTF-8 first
 # ---------------------------------------------------------------------------
 
-def test_read_file_handles_utf8_that_windows_default_encoding_mangles(tmp_path):
+def test_read_file_handles_utf8_that_windows_default_encoding_mangles(tmp_path, workspace):
     target = tmp_path / "unicode.py"
     text = "# caf\u00e9 na\u00efve \u2014 \u65e5\u672c\u8a9e \U0001f600\nvalue = '\u2713'\n"
     target.write_text(text, encoding="utf-8")
@@ -146,14 +146,14 @@ def test_read_file_handles_utf8_that_windows_default_encoding_mangles(tmp_path):
     assert "undecodable" not in out  # decoded cleanly, no replacement warning
 
 
-def test_round_trip_write_then_read_preserves_text_exactly(tmp_path):
+def test_round_trip_write_then_read_preserves_text_exactly(tmp_path, workspace):
     target = tmp_path / "rt.py"
     text = "s = '\u00e9\u00e8\u00ea \u2014 \u4f60\u597d'\n"
     assert "successfully" in invoke(write_file, file_path=str(target), content=text)
     assert invoke(read_file, file_path=str(target)) == text
 
 
-def test_edit_then_read_round_trips_unicode(tmp_path):
+def test_edit_then_read_round_trips_unicode(tmp_path, workspace):
     target = tmp_path / "e.py"
     original = "name = \"caf\u00e9\"\n"
     invoke(write_file, file_path=str(target), content=original)
@@ -162,7 +162,7 @@ def test_edit_then_read_round_trips_unicode(tmp_path):
     assert invoke(read_file, file_path=str(target)) == "name = \"th\u00e9\"\n"
 
 
-def test_read_file_flags_but_still_reads_non_utf8(tmp_path):
+def test_read_file_flags_but_still_reads_non_utf8(tmp_path, workspace):
     target = tmp_path / "latin.py"
     target.write_bytes(b"value = 'caf\xe9'\n")  # invalid UTF-8
     out = invoke(read_file, file_path=str(target))
@@ -179,20 +179,20 @@ def test_read_file_missing_and_empty_path():
 # write_file atomicity
 # ---------------------------------------------------------------------------
 
-def test_write_file_leaves_no_temp_file(tmp_path):
+def test_write_file_leaves_no_temp_file(tmp_path, workspace):
     target = tmp_path / "a.txt"
     invoke(write_file, file_path=str(target), content="hi")
     assert [p.name for p in tmp_path.iterdir()] == ["a.txt"]
 
 
-def test_write_file_replaces_content_wholesale(tmp_path):
+def test_write_file_replaces_content_wholesale(tmp_path, workspace):
     target = tmp_path / "b.txt"
     invoke(write_file, file_path=str(target), content="first-longer-content")
     invoke(write_file, file_path=str(target), content="second")
     assert target.read_text(encoding="utf-8") == "second"
 
 
-def test_write_file_failure_leaves_original_intact_and_cleans_up(tmp_path, monkeypatch):
+def test_write_file_failure_leaves_original_intact_and_cleans_up(tmp_path, monkeypatch, workspace):
     target = tmp_path / "c.txt"
     target.write_text("ORIGINAL", encoding="utf-8")
 
@@ -210,7 +210,7 @@ def test_write_file_failure_leaves_original_intact_and_cleans_up(tmp_path, monke
     monkeypatch.setattr(filesystem_tools.os, "replace", real_replace)
 
 
-def test_write_file_permission_error_is_reported(tmp_path):
+def test_write_file_permission_error_is_reported(tmp_path, workspace):
     out = invoke(write_file, file_path=str(tmp_path / "x" / "\0bad"), content="y")
     assert isinstance(out, str)
 
@@ -247,7 +247,7 @@ def _ask_middleware():
     factory.get_checkpointer = fake_checkpointer
     factory.create_agent = fake_create_agent
     try:
-        asyncio.run(factory.build_agent())
+        asyncio.run(factory.build_agent(factory.ask_policy()))
     finally:
         (factory.get_llm, factory.get_summarization_middleware,
          factory.get_checkpointer, factory.create_agent) = real

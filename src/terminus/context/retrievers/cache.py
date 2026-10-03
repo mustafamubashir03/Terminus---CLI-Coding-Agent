@@ -29,9 +29,6 @@ from __future__ import annotations
 import threading
 from typing import Any, Callable
 
-from terminus.observability.logging import get_logger
-
-logger = get_logger(__name__)
 
 _lock = threading.Lock()
 _stores: dict[tuple, Any] = {}

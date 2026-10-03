@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from pydantic import ConfigDict
 
 from terminus.observability.logging import get_logger
@@ -40,6 +42,15 @@ the provider gives one.
 """
 
 _exhausted_providers: dict[str, float] = {}
+
+#: Routing events already announced to the operator, so a decision reached through
+#: several nested fallback layers is stated once rather than once per layer.
+_REPORTED_ROUTES: set[tuple[str, tuple[str, ...]]] = set()
+
+
+def clear_reported_routes() -> None:
+    """Forget which routing events have been announced. For tests."""
+    _REPORTED_ROUTES.clear()
 
 
 def provider_exhausted_until(provider: str | None) -> float | None:
@@ -198,7 +209,11 @@ class FallbackChatModel(BaseChatModel):
         )
 
     def _log_primary_failure(self, failure: FailureInfo, attempt: int) -> None:
-        logger.warning(
+        # DEBUG, not WARNING. A route attempt failing is the routing layer doing
+        # its job, and with several fallback layers configured it repeats on every
+        # model call. At WARNING it buried the answer under repetition; the
+        # operator asks for it with --log-level DEBUG (or --dev).
+        logger.debug(
             "Provider route attempt failed: provider=%s model=%s category=%s "
             "status=%s retryable=%s exhausted=%s attempt=%s",
             self.primary_provider,
@@ -209,6 +224,21 @@ class FallbackChatModel(BaseChatModel):
             failure.exhausted,
             attempt,
         )
+
+    def _report_route_once(self, message: str, *args: Any) -> None:
+        """Log an informational routing event at most once per process.
+
+        The configured fallbacks are folded into one nested FallbackChatModel per
+        step, so the same provider is reached through several layers and each one
+        used to announce the same decision. The user saw "Provider fallback
+        selected" three times for a single question. The first announcement is
+        the useful part - which provider is actually answering, and why.
+        """
+        key = (message, tuple(str(a) for a in args))
+        if key in _REPORTED_ROUTES:
+            return
+        _REPORTED_ROUTES.add(key)
+        logger.info(message, *args)
 
     def _skip_exhausted_primary(self) -> bool:
         """True if this route's primary is known-spent, so it must not be called.
@@ -226,7 +256,9 @@ class FallbackChatModel(BaseChatModel):
             return False
         import time
 
-        logger.warning(
+        # DEBUG: this is consulted on every model call, so at WARNING it is the
+        # single most repetitive line in the program.
+        logger.debug(
             "Skipping exhausted provider: provider=%s model=%s usable_again_in=%.0fs",
             self.primary_provider,
             self.primary_model,
@@ -241,11 +273,14 @@ class FallbackChatModel(BaseChatModel):
         import time
 
         if deadline is not None:
-            logger.warning(
-                "Provider exhausted: provider=%s model=%s usable_again_in=%.0fs",
+            # INFO, and once: the operator genuinely wants to know a provider has
+            # been set aside, and for how long.
+            self._report_route_once(
+                "Provider %s/%s set aside for %.0fs: %s",
                 self.primary_provider,
                 self.primary_model,
                 max(0.0, deadline - time.time()),
+                failure.category,
             )
 
     def _generate(
@@ -281,12 +316,12 @@ class FallbackChatModel(BaseChatModel):
                     raise
                 if attempt < self.primary_attempts:
                     time.sleep(failure.retry_after or self.backoff_seconds * attempt)
-        logger.warning(
-            "Provider fallback selected: from=%s/%s to=%s/%s",
-            self.primary_provider,
-            self.primary_model,
+        self._report_route_once(
+            "Answering from %s/%s instead of %s/%s",
             self.fallback_provider,
             self.fallback_model,
+            self.primary_provider,
+            self.primary_model,
         )
         try:
             return self._result(
@@ -306,6 +341,176 @@ class FallbackChatModel(BaseChatModel):
                 failure,
                 attempts=self.primary_attempts + 1,
             ) from exc
+
+    def _stream(
+        self,
+        messages: list[Any],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
+        """Stream from the primary, falling back before the first chunk.
+
+        Without this, ``BaseChatModel.stream`` fell back to ``_generate`` and
+        emitted the whole answer as a single chunk, so ``streaming: true`` bought
+        nothing and the user saw the response appear in one block at the end.
+
+        A stream is only switchable to the fallback while nothing has been
+        yielded. Once a chunk has reached the caller, failing over mid-answer
+        would splice two providers' output together, so from that point on errors
+        propagate instead.
+        """
+        call_kwargs = self._kwargs(stop, run_manager, kwargs)
+        primary_exhausted = self._skip_exhausted_primary()
+        started = False
+
+        for attempt in range(1, self.primary_attempts + 1):
+            if primary_exhausted:
+                break
+            try:
+                # The private _stream, not the public .stream(). The public one
+                # yields chunk.message (an AIMessageChunk), while this method's
+                # caller expects ChatGenerationChunk - mixing them up raises
+                # AttributeError on the very first chunk.
+                for chunk in self.primary._stream(
+                    messages, stop=stop, run_manager=run_manager, **kwargs
+                ):
+                    started = True
+                    yield self._tag_chunk(chunk, self.primary_provider, self.primary_model)
+                return
+            except Exception as exc:
+                failure = self._should_fallback(exc)
+                self._log_primary_failure(failure, attempt)
+                if started:
+                    # Part of the answer is already out; a different provider
+                    # continuing it would produce nonsense.
+                    raise
+                if failure.exhausted:
+                    self._note_exhausted(failure)
+                    break
+                if not failure.retryable:
+                    raise
+                if attempt < self.primary_attempts:
+                    time.sleep(failure.retry_after or self.backoff_seconds * attempt)
+
+        self._report_route_once(
+            "Answering from %s/%s instead of %s/%s",
+            self.fallback_provider,
+            self.fallback_model,
+            self.primary_provider,
+            self.primary_model,
+        )
+        yield from self._stream_fallback(messages, call_kwargs, started)
+
+    async def _astream(
+        self,
+        messages: list[Any],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        """The async twin of :meth:`_stream`. See it for the failover rule."""
+        call_kwargs = self._kwargs(stop, run_manager, kwargs)
+        primary_exhausted = self._skip_exhausted_primary()
+        started = False
+
+        for attempt in range(1, self.primary_attempts + 1):
+            if primary_exhausted:
+                break
+            try:
+                async for chunk in self.primary._astream(
+                    messages, stop=stop, run_manager=run_manager, **kwargs
+                ):
+                    started = True
+                    yield self._tag_chunk(chunk, self.primary_provider, self.primary_model)
+                return
+            except Exception as exc:
+                failure = self._should_fallback(exc)
+                self._log_primary_failure(failure, attempt)
+                if started:
+                    raise
+                if failure.exhausted:
+                    self._note_exhausted(failure)
+                    break
+                if not failure.retryable:
+                    raise
+                if attempt < self.primary_attempts:
+                    await asyncio.sleep(
+                        failure.retry_after or self.backoff_seconds * attempt
+                    )
+
+        self._report_route_once(
+            "Answering from %s/%s instead of %s/%s",
+            self.fallback_provider,
+            self.fallback_model,
+            self.primary_provider,
+            self.primary_model,
+        )
+        async for chunk in self._astream_fallback(messages, call_kwargs, started):
+            yield chunk
+
+    def _stream_fallback(
+        self,
+        messages: list[Any],
+        call_kwargs: dict[str, Any],
+        started: bool,
+    ) -> Iterator[ChatGenerationChunk]:
+        try:
+            for chunk in self.fallback._stream(
+                messages, stop=call_kwargs.get("stop"), **{
+                    k: v for k, v in call_kwargs.items() if k != "stop"
+                }
+            ):
+                yield self._tag_chunk(chunk, self.fallback_provider, self.fallback_model)
+        except Exception as exc:
+            raise self._fallback_error(exc, started) from exc
+
+    async def _astream_fallback(
+        self,
+        messages: list[Any],
+        call_kwargs: dict[str, Any],
+        started: bool,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        try:
+            async for chunk in self.fallback._astream(
+                messages, stop=call_kwargs.get("stop"), **{
+                    k: v for k, v in call_kwargs.items() if k != "stop"
+                }
+            ):
+                yield self._tag_chunk(chunk, self.fallback_provider, self.fallback_model)
+        except Exception as exc:
+            raise self._fallback_error(exc, started) from exc
+
+    def _fallback_error(self, exc: Exception, started: bool) -> ProviderCallError:
+        failure = classify_failure(
+            exc, provider=self.fallback_provider, model=self.fallback_model
+        )
+        return ProviderCallError(
+            self.fallback_provider,
+            self.fallback_model,
+            failure,
+            attempts=self.primary_attempts + 1,
+        )
+
+    def _tag_chunk(
+        self, chunk: Any, provider: str, model: str
+    ) -> Any:
+        """Stamp the route onto a chunk, as ``_result`` does for a full result.
+
+        Best-effort: a chunk that does not carry response metadata is passed
+        through untouched rather than being dropped.
+        """
+        message = getattr(chunk, "message", None)
+        if message is None:
+            return chunk
+        try:
+            metadata = dict(getattr(message, "response_metadata", None) or {})
+            metadata.setdefault("terminus_provider", provider)
+            metadata.setdefault("terminus_model", model)
+            message.response_metadata = metadata
+        except Exception:  # pragma: no cover - metadata is advisory only
+            pass
+        return chunk
 
     async def _agenerate(
         self,
@@ -338,12 +543,12 @@ class FallbackChatModel(BaseChatModel):
                     await asyncio.sleep(
                         failure.retry_after or self.backoff_seconds * attempt
                     )
-        logger.warning(
-            "Provider fallback selected: from=%s/%s to=%s/%s",
-            self.primary_provider,
-            self.primary_model,
+        self._report_route_once(
+            "Answering from %s/%s instead of %s/%s",
             self.fallback_provider,
             self.fallback_model,
+            self.primary_provider,
+            self.primary_model,
         )
         try:
             response = await self.fallback.ainvoke(messages, **call_kwargs)

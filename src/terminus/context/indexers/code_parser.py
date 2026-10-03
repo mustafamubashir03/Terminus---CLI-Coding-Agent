@@ -9,22 +9,18 @@ logger = get_logger(__name__)
 
 
 EXTENSION_TO_LANGUAGE = {
-    # Python
     '.py': 'python',
     '.pyi': 'python',
 
-    # JavaScript / TypeScript
     '.js': 'javascript',
     '.jsx': 'javascript',
     '.ts': 'typescript',
     '.tsx': 'tsx',
 
-    # Java / Kotlin / Scala
     '.java': 'java',
     '.kt': 'kotlin',
     '.scala': 'scala',
 
-    # C / C++ / Objective-C
     '.c': 'c',
     '.cpp': 'cpp',
     '.h': 'c',
@@ -32,25 +28,20 @@ EXTENSION_TO_LANGUAGE = {
     '.m': 'objc',
     '.mm': 'objc',
 
-    # C# / F# / VB.NET
     '.cs': 'c_sharp',
     '.fs': 'f_sharp',
     '.vb': 'vb_net',
 
-    # Go
     '.go': 'go',
 
-    # Rust
     '.rs': 'rust',
 
-    # Web
     '.html': 'html',
     '.css': 'css',
     '.scss': 'scss',
     '.sass': 'scss',
     '.less': 'less',
 
-    # Markup
     '.md': 'markdown',
     '.markdown': 'markdown',
     '.xml': 'xml',
@@ -58,7 +49,6 @@ EXTENSION_TO_LANGUAGE = {
     '.yaml': 'yaml',
     '.yml': 'yaml',
 
-    # Shell / Batch
     '.sh': 'bash',
     '.bash': 'bash',
     '.zsh': 'bash',
@@ -67,13 +57,10 @@ EXTENSION_TO_LANGUAGE = {
     '.bat': 'batch',
     '.cmd': 'batch',
 
-    # PHP
     '.php': 'php',
 
-    # Ruby
     '.rb': 'ruby',
 
-    # Config / Other
     '.ini': 'ini',
     '.conf': 'ini',
     '.toml': 'toml',

@@ -19,36 +19,30 @@ own ``ExecutionContext`` supplies the policy, so a /plan worker is allowed
 exactly what its policy allows and nothing more. A worker has no approver, so
 DESTRUCTIVE is refused. Output is redacted and bounded like /ask's, so a worker's
 transcript cannot leak credentials or blow up its context.
+
+The directory argument gets the same treatment. ``run_command_in_directory``
+used to hand ``directory`` straight to ``subprocess.run(cwd=...)`` with no check
+at all, which made it the one tool in the project that could run a command
+anywhere on the host. It now resolves through ``terminus.workspace`` like every
+other model-supplied path, and a directory outside the workspace is refused.
 """
 
 import subprocess
-from contextlib import contextmanager
 
-from langchain.tools import tool
+from langchain_core.tools import ToolException
 
 from terminus.coordination import project_write_guard
-from terminus.execution import current_execution
-from terminus.permissions import Operation, redact_secrets
+from terminus.permissions import Operation, redact_secrets, sanitized_env
+from terminus.tools import refusing_tool
+from terminus.workspace import (
+    WorkspaceViolation,
+    project_root,
+    resolve_in_workspace,
+)
 
 _TIMEOUT_SECONDS = 30
 _MAX_STREAM_CHARS = 8_000
 """Matches the /ask per-stream bound and the persisted task-result bound."""
-
-
-@contextmanager
-def _write_guard(command: str, directory: str | None):
-    """Authorise a shell command and hold the project writer lock while it runs.
-
-    Same contract as ``terminus.coordination.project_write_guard``, wrapped here
-    so both /plan shell tools label their refusal with the directory. Read-only
-    commands are authorised but never take the lock.
-    """
-    running = current_execution()
-    context = f"{running.label} in {directory}" if running else None
-    with project_write_guard(
-        Operation.EXECUTE, command=command, context=context
-    ) as grant:
-        yield grant
 
 
 def _bounded(text: str) -> str:
@@ -68,7 +62,7 @@ def _format_result(result: subprocess.CompletedProcess) -> str:
     return "\n".join(parts) if parts else "No output"
 
 
-@tool("run_shell_command")
+@refusing_tool(name="run_shell_command")
 def run_command(command: str) -> str:
     """ Run a shell command in the project. Times out after 30 seconds.
 
@@ -80,7 +74,7 @@ def run_command(command: str) -> str:
         return "No command provided"
     command = command.strip()
 
-    with _write_guard(command, None) as grant:
+    with project_write_guard(Operation.EXECUTE, command=command) as grant:
         blocked = grant.refused or grant.deferred
         if blocked:
             return blocked
@@ -100,6 +94,7 @@ def _execute(command: str, directory: str | None) -> str:
             capture_output=True,
             timeout=_TIMEOUT_SECONDS,
             cwd=directory,
+            env=sanitized_env(),
         )
         return _format_result(result)
     except subprocess.TimeoutExpired:
@@ -108,19 +103,32 @@ def _execute(command: str, directory: str | None) -> str:
         return f"Error running command: {str(e)}"
 
 
-@tool("run_command_in_directory")
+@refusing_tool(name="run_command_in_directory")
 def run_in_directory(command: str, directory: str = None) -> str:
-    """ Run a shell command inside a specific directory. Times out after 30 seconds.
+    """ Run a shell command inside a workspace directory. Times out after 30 seconds.
 
     Authorized by the current execution's permission policy, exactly like
-    'run_shell_command'.
+    'run_shell_command'. 'directory' is workspace-relative, defaults to the
+    workspace root, and cannot point outside the workspace.
     """
     if not command or not command.strip():
         return "No command provided"
     command = command.strip()
 
-    with _write_guard(command, directory) as grant:
+    try:
+        target = (
+            resolve_in_workspace(directory) if directory else project_root()
+        )
+    except WorkspaceViolation as exc:
+        raise ToolException(
+            f"{exc} run_command_in_directory cannot execute outside the workspace."
+        ) from exc
+
+    if not target.is_dir():
+        return f"Cannot run command: directory does not exist: {target}"
+
+    with project_write_guard(Operation.EXECUTE, command=command) as grant:
         blocked = grant.refused or grant.deferred
         if blocked:
             return blocked
-        return _execute(command, directory)
+        return _execute(command, str(target))
