@@ -605,7 +605,7 @@ async def terminus_cli_run() -> bool:
     Returns False only when startup failed, which the caller uses to choose an
     exit code. A REPL that ran and was then quit is a success.
     """
-    from terminus.cli import initialize, _shutdown_report
+    from terminus.cli import _shutdown_report, initialize, start_sandbox
 
     logger.info("Starting Terminus CLI")
     try:
@@ -638,6 +638,33 @@ async def terminus_cli_run() -> bool:
             )
         )
         _first_run_notice()
+
+        # One container for the session, before the first tool can run. It is
+        # started here rather than lazily per command so that an agent's first
+        # shell call is not also the thing that discovers Docker is missing, and
+        # so a session that runs no commands pays no image pull.
+        #
+        # A failure here ends the session. The alternative - carry on without a
+        # container - would run every command on the host under a session that
+        # the operator believes is sandboxed, which is a downgrade nobody asked
+        # for and only a warning stands between.
+        from terminus.sandbox import SandboxUnavailable
+
+        try:
+            await start_sandbox()
+        except SandboxUnavailable as exc:
+            logger.error("Sandbox startup failed: %s", exc)
+            console.print(
+                "\n[bold red]Terminus could not start the sandbox.[/bold red]\n"
+                f"{exc}\n\n"
+                "[dim]Commands would run on the host without it, so the session "
+                "is ending instead. Start Docker, build the image with "
+                "[cyan]docker build -t terminus-sandbox:latest src/terminus/sandbox/Dockerfile[/cyan], "
+                "or turn the boundary off deliberately with "
+                "[cyan]terminus config set sandbox.enabled false[/cyan].[/dim]"
+            )
+            return False
+
         await _repl_loop(str(Path.cwd()))
     finally:
         await _shutdown_report()

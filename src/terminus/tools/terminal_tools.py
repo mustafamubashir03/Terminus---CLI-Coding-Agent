@@ -33,6 +33,7 @@ from langchain_core.tools import ToolException
 
 from terminus.coordination import project_write_guard
 from terminus.permissions import Operation, redact_secrets, sanitized_env
+from terminus.sandbox import SandboxError, current_sandbox
 from terminus.tools import refusing_tool
 from terminus.workspace import (
     WorkspaceViolation,
@@ -51,14 +52,38 @@ def _bounded(text: str) -> str:
     return f"{text[:_MAX_STREAM_CHARS]}\n... [truncated at {_MAX_STREAM_CHARS} chars]"
 
 
-def _format_result(result: subprocess.CompletedProcess) -> str:
+def _exit_code(result) -> int:
+    """The exit status of either backend's result object.
+
+    ``subprocess.CompletedProcess`` spells this ``returncode`` and
+    :class:`~terminus.sandbox.ExecutionResult` spells it ``exit_code``. Reading
+    one name off both meant the host path raised ``AttributeError`` on every
+    command - a silent break of the only backend that was there before.
+    """
+    for attribute in ("exit_code", "returncode"):
+        value = getattr(result, attribute, None)
+        if value is not None:
+            return int(value)
+    raise AttributeError(
+        f"{type(result).__name__} has neither exit_code nor returncode"
+    )
+
+
+def _format_result(result) -> str:
+    """The compact report a worker reads.
+
+    Accepts a ``subprocess.CompletedProcess`` or a
+    :class:`~terminus.sandbox.ExecutionResult`; both carry stdout, stderr and an
+    exit status, so one formatter serves both execution backends.
+    """
     parts = []
     if result.stdout:
         parts.append(redact_secrets(_bounded(result.stdout.rstrip())))
     if result.stderr:
         parts.append(f"ERROR:\n{redact_secrets(_bounded(result.stderr.rstrip()))}")
-    if result.returncode != 0:
-        parts.append(f"Exit code {result.returncode}")
+    exit_code = _exit_code(result)
+    if exit_code != 0:
+        parts.append(f"Exit code {exit_code}")
     return "\n".join(parts) if parts else "No output"
 
 
@@ -83,7 +108,26 @@ def run_command(command: str) -> str:
 
 def _execute(command: str, directory: str | None) -> str:
     """Run an authorised command. Called with the project writer lock held when
-    the command can mutate the workspace."""
+    the command can mutate the workspace.
+
+    The permission decision, the lock, this module's own 30 second timeout and
+    the report format below are unchanged. Only where the command runs has moved:
+    with a Sandbox installed for the execution it runs in that container, and
+    without one it runs as a host process.
+    """
+    sandbox = current_sandbox()
+    if sandbox is not None:
+        try:
+            result = sandbox.execute(
+                command, timeout=_TIMEOUT_SECONDS, cwd=directory
+            )
+        except SandboxError as exc:
+            return f"Error running command: {exc}"
+        return _format_result(result)
+    return _execute_on_host(command, directory)
+
+
+def _execute_on_host(command: str, directory: str | None) -> str:
     try:
         result = subprocess.run(
             command,

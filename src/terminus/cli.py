@@ -181,6 +181,69 @@ def format_startup_error(exc: BaseException) -> str:
     return f"{message}\n{diagnostics}" if diagnostics else message
 
 
+async def start_sandbox():
+    """Start the session's sandbox container, if the boundary is enabled.
+
+    Called once per session, so a session gets one container rather than one per
+    command.
+
+    With the boundary enabled a container that will not start is **fatal**. An
+    earlier version reported the failure, left the sandbox unset and let commands
+    fall through to the host path that predates this boundary, which quietly
+    turned "sandboxed execution" into "unsandboxed execution with a warning in the
+    log" - the exact outcome the boundary exists to prevent, arrived at by
+    ignoring an error rather than by choosing it. So this raises instead, and the
+    session starts with no model and no tools rather than with weaker isolation
+    than the operator asked for.
+
+    Turning ``sandbox.enabled`` off remains the supported way to run without
+    Docker, and that choice is recorded in the log rather than inferred from a
+    failure.
+    """
+    from terminus.config import CONFIG
+    from terminus.sandbox import (
+        Sandbox,
+        SandboxUnavailable,
+        sandbox_enabled,
+        set_sandbox,
+    )
+
+    if not sandbox_enabled():
+        logger.info("Sandbox disabled by configuration; commands run on the host")
+        return None
+
+    image = (CONFIG.get("sandbox") or {}).get("image") or None
+    sandbox = Sandbox(image=image) if image else Sandbox()
+    try:
+        sandbox.start()
+    except SandboxUnavailable:
+        raise
+    except Exception as exc:
+        raise SandboxUnavailable(
+            f"The sandbox is enabled but its container could not be started: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    set_sandbox(sandbox)
+    logger.info("Sandbox %s started", sandbox.container_name)
+    return sandbox
+
+
+async def stop_sandbox() -> None:
+    """Remove this session's container. Never raises."""
+    from terminus.sandbox import SandboxError, current_sandbox, set_sandbox
+
+    sandbox = current_sandbox()
+    if sandbox is None:
+        return
+    try:
+        sandbox.stop()
+    except SandboxError as exc:
+        logger.warning("Error stopping sandbox: %s", exc)
+    finally:
+        set_sandbox(None)
+
+
 async def shutdown_resources():
     """Release the process-wide resources Terminus owns.
 
@@ -190,6 +253,8 @@ async def shutdown_resources():
     """
     from terminus.memory.short_term import close_checkpointer
     from terminus.mcp.terminus_mcp_client import close_terminus_mcp
+
+    await stop_sandbox()
 
     for label, close in (
         ("checkpointer", close_checkpointer),

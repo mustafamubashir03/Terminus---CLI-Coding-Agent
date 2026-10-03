@@ -7,6 +7,9 @@ license = { text = "MIT" }
 requires-python = ">=3.12, <3.13"
 dependencies = [
     "aiosqlite>=0.22.1",
+    # Official Docker SDK. The sandbox talks to the daemon through this; it
+    # never shells out to the docker CLI.
+    "docker>=7.1.0",
     "chromadb",
     "fastembed>=0.8.0",
     "firecrawl-py>=4.44.0",

@@ -5,13 +5,28 @@ Deliberately separate from ``tools/terminal_tools.py``, which belongs to the
 
 The model supplies only ``command`` and an optional ``working_directory``. It
 cannot supply a permission level, an approval, or a timeout: those come from
-``terminus.permissions`` and from module constants below. Permission is always
-resolved by the runtime before a subprocess is created.
+``terminus.permissions``, from module constants below, and from the caller's own
+timeout argument. Permission is always resolved by the runtime before anything is
+executed.
+
+Two boundaries, in this order:
+
+* **Authorisation** - :func:`terminus.coordination.project_write_guard`, exactly
+  as before. Unchanged by the move to a sandbox.
+* **Execution** - a :class:`terminus.sandbox.Sandbox` container. The command runs
+  in a container that has the workspace bind-mounted, not as a host process.
+
+When no Sandbox is installed for this execution the command runs on the host. With
+``sandbox.enabled`` on that state is unreachable in a session: session startup
+treats a sandbox that will not start as fatal, so a live session either has a
+container or never ran a command at all. The host path below therefore exists for
+a boundary the operator has switched off, and for tests, and a sandbox that *fails*
+raises rather than quietly re-running the command here.
 
 The working directory is the other half of the model's reach. ``run_command`` is
-the tool that can touch anything the OS lets it, so its ``working_directory`` is
-resolved through ``terminus.workspace`` like every filesystem path and defaults
-to the workspace root rather than the process cwd.
+the tool that can touch anything the environment lets it, so its
+``working_directory`` is resolved through ``terminus.workspace`` like every
+filesystem path and defaults to the workspace root rather than the process cwd.
 """
 
 from __future__ import annotations
@@ -33,6 +48,7 @@ from terminus.permissions import (
     sanitized_env,
     set_permission_policy,
 )
+from terminus.sandbox import SandboxError, current_sandbox
 from terminus.tools import refusing_tool
 from terminus.workspace import (
     WorkspaceViolation,
@@ -215,19 +231,57 @@ def _spawn(command: str, cwd: Path) -> subprocess.Popen:
 
 def _execute(command: str, cwd: Path, decision) -> str:
     """Run an authorised command. Called with the project writer lock held
-    when the command can mutate the workspace."""
+    when the command can mutate the workspace.
 
+    Everything above this line - the permission decision, the lock, the timeout
+    this tool owns, the truncation and redaction below - is unchanged. Only where
+    the command runs has moved.
+    """
+    level = decision.level.value
+    sandbox = current_sandbox()
+    if sandbox is not None:
+        outcome = _run_in_sandbox(sandbox, command, cwd)
+    else:
+        outcome = _run_on_host(command, cwd)
+    return _format(
+        *outcome,
+        command=command,
+        cwd=cwd,
+        timeout=_COMMAND_TIMEOUT_SECONDS,
+        level=level,
+    )
+
+
+def _run_in_sandbox(sandbox, command: str, cwd: Path):
+    """Run *command* in the container and return ``(exit_code, stdout, stderr)``.
+
+    A sandbox failure is reported, never retried on the host.
+    """
+    try:
+        result = sandbox.execute(
+            command, timeout=_COMMAND_TIMEOUT_SECONDS, cwd=cwd
+        )
+    except SandboxError as exc:
+        # Deliberately not ``None``. In ``_format`` a None exit code means the
+        # wait was bounded and the command never finished, so returning None
+        # here would report a Docker failure to the model as "Command timed out
+        # after 120s and was terminated" - a claim about a command that never
+        # ran. The boundary failed; the report has to say that instead.
+        return 1, "", f"Sandbox error: {exc}"
+    return result.exit_code, result.stdout, result.stderr
+
+
+def _run_on_host(command: str, cwd: Path):
+    """Run *command* as a host process. Used when no Sandbox is installed."""
     try:
         process = _spawn(command, cwd)
     except (OSError, ValueError) as exc:
-        return f"Cannot run command: {type(exc).__name__}: {exc}"
+        return None, "", f"Cannot run command: {type(exc).__name__}: {exc}"
 
     try:
         stdout, stderr = process.communicate(timeout=_COMMAND_TIMEOUT_SECONDS)
-        returncode = process.returncode
-        timed_out = False
+        return process.returncode, stdout or "", stderr or ""
     except subprocess.TimeoutExpired:
-        timed_out = True
         _kill_tree(process)
         try:
             stdout, stderr = process.communicate(timeout=_KILL_GRACE_SECONDS)
@@ -236,22 +290,33 @@ def _execute(command: str, cwd: Path, decision) -> str:
             # would reinstate exactly the unbounded wait this code exists to
             # prevent, so report the timeout and drop the partial output rather
             # than pretend to have captured it.
-            stdout, stderr = "", ""
-            for pipe in (process.stdout, process.stderr):
-                try:
-                    pipe.close()
-                except (OSError, ValueError):
-                    pass
-        returncode = None
+            return None, "", ""
+        return None, stdout or "", stderr or ""
     except (OSError, ValueError) as exc:
-        return f"Cannot run command: {type(exc).__name__}: {exc}"
+        return None, "", f"Cannot run command: {type(exc).__name__}: {exc}"
 
-    if timed_out:
+
+def _format(
+    exit_code: int | None,
+    stdout: str,
+    stderr: str,
+    *,
+    command: str,
+    cwd: Path,
+    timeout: int,
+    level: str,
+) -> str:
+    """The report the model reads. Unchanged in shape from the host version.
+
+    ``exit_code is None`` still means "the wait was bounded but the command did
+    not finish", which is how a timeout is reported.
+    """
+    if exit_code is None:
         partial, cut = _bounded((stdout or "") + (stderr or ""), _MAX_TOTAL_CHARS)
         note = "\n[truncated]" if cut else ""
         body = f"\npartial output:\n{partial}{note}" if partial else ""
         return (
-            f"Command timed out after {_COMMAND_TIMEOUT_SECONDS}s and was terminated."
+            f"Command timed out after {timeout}s and was terminated."
             f"\n  command: {command}\n  working directory: {cwd}{body}"
         )
 
@@ -263,7 +328,7 @@ def _execute(command: str, cwd: Path, decision) -> str:
     parts = [
         f"$ {command}",
         f"working directory: {cwd}",
-        f"result: {_describe_exit(returncode)}",
+        f"result: {_describe_exit(exit_code)}",
     ]
     if out_cut:
         parts.append(f"stdout: [truncated at {_MAX_STREAM_CHARS} chars]")
@@ -284,5 +349,5 @@ def _execute(command: str, cwd: Path, decision) -> str:
     if total > _MAX_TOTAL_CHARS:
         parts.append(f"[total output truncated at {_MAX_TOTAL_CHARS} characters]")
 
-    logger.info("ran command (level=%s, rc=%s)", decision.level.value, returncode)
+    logger.info("ran command (level=%s, rc=%s)", level, exit_code)
     return "\n".join(parts)

@@ -56,6 +56,15 @@ DEFAULT_CONFIG = {
         "route_max_attempts": 2,
         "route_backoff_seconds": 5,
     },
+    "sandbox": {
+        # Shell commands run in a container, not as host processes. On by default
+        # because the whole point is that an agent-issued command cannot reach the
+        # machine; an operator can turn it off deliberately, and there is no
+        # automatic fallback - if this is on and Docker is unreachable, commands
+        # fail rather than quietly running on the host.
+        "enabled": True,
+        "image": "terminus-sandbox:latest",
+    },
     "memory": {
         "db_path": ".terminus/memory/terminus.db",
         "summarize_at_tokens": 4000,
