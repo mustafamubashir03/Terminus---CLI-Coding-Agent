@@ -18,8 +18,46 @@ Update it whenever you learn something useful.
 - The workspace has exactly one identity, `terminus.workspace.project_root()`.
   Filesystem tools and Git tools both resolve through it. There is no second
   workspace concept.
+- **An enabled Sandbox never falls back to the host.** `cli.start_sandbox()`
+  raises when the container will not start, and `terminus_cli_run` ends the
+  session rather than continuing without isolation. The alternative - log a
+  warning, leave the ContextVar unset, let the tools' host path take over -
+  produces a session that *believes* it is sandboxed while every command runs on
+  the host. Turning `sandbox.enabled` off is the supported way to run without
+  Docker; that is a choice, not a failure mode.
+- **One container per session, injected through a `ContextVar`.** The tools read
+  `current_sandbox()` and never construct a `Sandbox`, because constructing one
+  per command is a container per command. `tests/test_sandbox.py` asserts both
+  halves, plus that a `/plan` worker in a child task inherits the container.
 
 ## Gotchas
+
+- **A Docker bind mount silently binds the wrong tree when the source path is
+  relative.** Docker resolves a volume source against the *daemon's* working
+  directory, not the client's. The container then starts, `/workspace` exists,
+  every command succeeds, and none of them touch the host workspace. So
+  `Sandbox.__init__` calls `.resolve()`, and the startup check writes a token file
+  on the host and reads that exact path back out of the container. Checking
+  `test -d /workspace` is worthless here: the image creates `/workspace` at build
+  time, so it passes against a container that has the host workspace nowhere in
+  it. This actually happened and shipped no commands to the host.
+- **Container paths must be built with `PurePosixPath`, not `Path`.**
+  `Path("/workspace") / "sub"` is `\workspace\sub` on Windows, which is not a path
+  inside the container.
+- **`tempfile.mkdtemp` makes an owner-only ACL on Windows that Docker cannot write
+  through.** The sandbox integration tests therefore use a directory inside the
+  checkout (`.sandbox-integration/`, gitignored) rather than `tmp_path`. A
+  sandbox test failing on a temp directory is usually this, not the sandbox.
+- **The sandbox image tag is pinned and mirrored in two places.**
+  `sandbox.SANDBOX_IMAGE` and `CONFIG["sandbox"]["image"]` must be equal, because
+  `start_sandbox` reads the config key and a stale default silently overrides the
+  pinned tag with `latest`. `tests/test_sandbox.py` asserts they agree.
+- **The sandbox image carries a toolchain, not this repository's dependencies.**
+  It ships pytest deliberately - an agent's first move is usually running tests,
+  and making that cost a `pip install` per container spends a turn on it - but
+  langgraph and the rest are the project's business and are installed per session
+  in the disposable container. So "the project's own suite runs in the bare image"
+  is false; the integration test runs a project's tests instead.
 
 - **Comments in this repo are documentation, not noise.** They record *why* a
   non-obvious choice was made, plus scope limits and past defects. Specific ones

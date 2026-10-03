@@ -17,3 +17,8 @@ wheels/
 # tree and is rebuildable, and some of it is large (the checkpointer grows with
 # every conversation), so none of it belongs in version control.
 .terminus/
+# Scratch workspace for the Docker sandbox integration tests. They need a real
+# directory inside the checkout rather than a temp one - see the `workspace`
+# fixture in tests/test_sandbox_docker.py - so ignore it in case a run is
+# interrupted between creating it and cleaning it up.
+.sandbox-integration/

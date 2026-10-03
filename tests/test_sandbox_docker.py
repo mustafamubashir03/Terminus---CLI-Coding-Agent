@@ -72,19 +72,26 @@ pytestmark.append(
 
 
 @pytest.fixture
-def workspace(tmp_path: Path) -> Path:
-    """A workspace inside the repository.
+def workspace():
+    """A workspace inside the repository, removed however the test ends.
 
     Deliberately not tmp_path. On Windows ``tempfile.mkdtemp`` applies mode
     0700, which becomes an owner-only ACL, and Docker's file sharing cannot write
     through it - so a sandbox test run against a temp directory fails on a host
     restriction that has nothing to do with the sandbox. The repository is where
     these containers are meant to work.
+
+    The cleanup lives here rather than in the ``sandbox`` fixture because several
+    tests use the workspace without one. When it lived there, a test that built
+    its own container left its files behind in the checkout.
     """
     probe = Path.cwd() / ".sandbox-integration"
     shutil.rmtree(probe, ignore_errors=True)
     probe.mkdir(parents=True, exist_ok=True)
-    return probe
+    try:
+        yield probe
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
 
 
 @pytest.fixture
@@ -95,7 +102,6 @@ def sandbox(workspace: Path):
         yield box
     finally:
         box.stop()
-        shutil.rmtree(workspace, ignore_errors=True)
 
 
 def test_the_container_is_running_and_is_not_root(sandbox: Sandbox):
