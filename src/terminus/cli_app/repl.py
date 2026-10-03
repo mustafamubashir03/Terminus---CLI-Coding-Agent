@@ -193,15 +193,25 @@ class Command:
 
 
 async def _ask(repl: Repl, argument: str) -> None:
-    from terminus.agent.orchestrator import handle_query
+    from terminus.agent.orchestrator import outcome_note, run_turn
 
     if not argument:
         console.print("[bold red]Please enter a question[/bold red]")
         return
     console.print(f"[bold green]Question:[/bold green] {argument}")
     try:
-        response = await handle_query(argument, repl.session_id)
-        console.print(f"[bold blue]Response:[/bold blue] {response}")
+        result = await run_turn(argument, repl.session_id)
+        # The answer, then how it ended. Without the second line a turn that ran
+        # out of budget, failed, or claimed success it never verified is presented
+        # exactly like one that worked.
+        note = outcome_note(result)
+        if note:
+            console.print(f"[bold yellow]{note}[/bold yellow]")
+        console.print(f"[bold blue]Response:[/bold blue] {result.text}")
+        if result.tool_failures:
+            console.print("[bold yellow]Tools that failed:[/bold yellow]")
+            for failure in result.tool_failures:
+                console.print(f"  {failure}")
     except Exception as exc:
         # Logged at debug, not error: the message is already shown to the user
         # below, and printing it twice - once as a log line, once as output -

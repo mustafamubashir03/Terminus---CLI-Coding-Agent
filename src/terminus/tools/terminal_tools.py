@@ -103,7 +103,12 @@ def run_command(command: str) -> str:
         blocked = grant.refused or grant.deferred
         if blocked:
             return blocked
-        return _execute(command, None)
+        # The workspace root, explicitly. Passing None would be read as "the host
+        # process's current directory" by the host executor, which is whatever
+        # directory Terminus happened to be launched from - not this project. The
+        # container path resolves None to /workspace, so leaving it implicit made
+        # the two execution backends disagree about where "here" is.
+        return _execute(command, project_root())
 
 
 def _execute(command: str, directory: str | None) -> str:

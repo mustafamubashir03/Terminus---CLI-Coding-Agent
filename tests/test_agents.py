@@ -24,7 +24,7 @@ from terminus.agents import (
     AgentStatus,
     ChildSpec,
     build_child_context,
-    child_policy,
+    child_permission_policy,
     spawn_agent,
 )
 from terminus.agents.roles import ROLES, describe_roles, get_role, role_names
@@ -80,7 +80,7 @@ def test_the_five_initial_roles_exist():
 def test_read_only_roles_cannot_write():
     for name in ("researcher", "reviewer", "tester", "debugger"):
         assert ROLES[name].write is False, f"{name} must not be able to write"
-        policy = child_policy(ROLES[name])
+        policy = child_permission_policy(ROLES[name])
         assert PermissionLevel.WRITE in policy.deny_levels
         assert PermissionLevel.DESTRUCTIVE in policy.deny_levels
 
@@ -88,7 +88,7 @@ def test_read_only_roles_cannot_write():
 def test_the_implementer_can_write_but_never_destructively():
     role = ROLES["implementer"]
     assert role.write is True
-    policy = child_policy(role)
+    policy = child_permission_policy(role)
     assert PermissionLevel.WRITE in policy.auto_approve
     assert PermissionLevel.DESTRUCTIVE in policy.deny_levels
 
@@ -102,7 +102,7 @@ def test_a_destructive_role_is_refused_at_policy_construction():
 
     role = replace(ROLES["researcher"], destructive=True)
     with pytest.raises(ValueError, match="not grantable"):
-        child_policy(role)
+        child_permission_policy(role)
 
 
 def test_roles_are_described_for_the_parent():

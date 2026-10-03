@@ -73,9 +73,15 @@ class _FakeAgent:
         self.sink = sink
 
     async def ainvoke(self, payload, config=None, **kw):
+        from langchain_core.messages import AIMessage
+
         self.sink["config"] = config
         self.sink["payload"] = payload
-        return {"messages": [{"role": "assistant", "content": "child answer"}]}
+        # An AIMessage, not a plain dict: the runner reads the last message's
+        # `.content`, and a dict has no such attribute. Returning the dict shape
+        # here made this child produce no output at all while still reporting
+        # success, which is the failure the empty-output rule now catches.
+        return {"messages": [AIMessage(content="child answer")]}
 
 
 @sync_async
@@ -192,9 +198,9 @@ async def test_a_write_capable_child_gets_write_permission_under_its_own_scope(m
 
 
 def test_a_read_only_child_context_denies_writes():
-    from terminus.agents.spawn import child_policy
+    from terminus.agents.spawn import child_permission_policy
 
-    policy = child_policy(ROLES["researcher"])
+    policy = child_permission_policy(ROLES["researcher"])
     assert PermissionLevel.WRITE in policy.deny_levels
     assert PermissionLevel.DESTRUCTIVE in policy.deny_levels
 

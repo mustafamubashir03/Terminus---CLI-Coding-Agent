@@ -32,6 +32,7 @@ from terminus.agent.observation import observation_pending
 from terminus.execution import ask_context, execution_scope
 from terminus.llm.text import message_text
 from terminus.observability.logging import get_logger
+from terminus.permissions import redact_secrets
 from terminus.observability.usage_tracker import (
     ToolCallbackHandler,
     UsageCallbackHandler,
@@ -257,9 +258,13 @@ async def run_turn(
                 type(exc).__name__,
                 exc,
             )
-            return finish(Outcome.DONE, best)
+            return finish(Outcome.FAILED, best)
         logger.error("Agent turn failed: %s: %s", type(exc).__name__, exc)
-        return finish(Outcome.FAILED, f"Query failed: {exc}")
+        # The exception text reaches a human, and an exception raised anywhere
+        # below this can have a provider's URL, a request header or an API key in
+        # its message. It goes through the same redactor the shell tool uses rather
+        # than through a second, differently-behaving scanner.
+        return finish(Outcome.FAILED, f"Query failed: {redact_secrets(str(exc))}")
 
     flush_turn()
 
@@ -280,12 +285,37 @@ async def run_turn(
     return finish(Outcome.FAILED, "The agent produced no answer.")
 
 
+def outcome_note(result: TurnResult) -> str:
+    """One honest line about how a turn ended, or ``""`` when it simply worked.
+
+    A turn that ended badly and a turn that ended well both used to reach the user
+    as the same block of text, because :func:`handle_query` returns only the
+    answer. A caller that cares can print this; a caller that does not is
+    unaffected. An unverified answer is called out even when the outcome is DONE,
+    because "it says it passed" and "it passed" are different claims and the
+    model is the one that made the first one.
+    """
+    if result.outcome is not Outcome.DONE:
+        return f"[{result.outcome.value}]"
+    if result.unverified:
+        return (
+            "[unverified: the agent changed files and did not read the result "
+            "back before answering]"
+        )
+    return ""
+
+
 async def handle_query(question: str, thread_id: str | None = None,
                        interactive: bool = True) -> str:
     """Run one /ask turn and return its answer text.
 
     Owns the permission policy for the turn: the whole stream runs inside an
     execution scope, so the tools see /ask's authority and nothing else.
+
+    Returns the text only. A caller that needs to know *how* the turn ended -
+    failed, cancelled, out of budget, or answered without verifying its own work -
+    should call :func:`run_turn` and read the :class:`TurnResult`, optionally
+    rendering :func:`outcome_note`.
     """
     logger.info("Handling query: %s", question)
     result = await run_turn(question, thread_id, interactive=interactive)

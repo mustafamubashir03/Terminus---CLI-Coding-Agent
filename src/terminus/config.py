@@ -7,12 +7,18 @@ Precedence, highest first:
     the packaged ``config.yaml``          (shipped defaults for an installed Terminus)
     ``DEFAULT_CONFIG`` below
 
-The first file that exists wins outright - it is *not* a merge of all of them.
-That is deliberate. Layering them would make it impossible to say where any
-single value came from, and a user who edits their project config would have to
-know which of the other layers was overriding them. The global file sits *below*
-the project file for the same reason: a repository's own configuration is more
-specific than a general default, and must not be surprised by it.
+The layers are **merged**, lowest precedence first, so a higher layer overrides only
+the keys it actually mentions. Setting one value in a project file no longer
+discards the rest of the developer's global configuration, which is what "project
+overrides global" has to mean for a hierarchy to be usable. ``CONFIG_SOURCE_LAYERS``
+records which files contributed so "where did this value come from" is still
+answerable; ``CONFIG_SOURCE`` is the highest-precedence layer that said anything.
+
+An override whose value is ``None`` is skipped rather than assigned. YAML reads a
+bare ``llm:`` - a section someone emptied out, or commented the contents of - as
+``None``, and assigning that would discard the defaults and everything below it.
+"No value here" has to mean "no opinion here", or the file stops being
+hand-editable.
 
 What each layer is for:
 
@@ -25,10 +31,14 @@ What each layer is for:
 Credentials are deliberately **not** in any of these. They live in ``.env`` or
 ``~/.terminus/credentials.env``; see :mod:`terminus.user_config`.
 
-``CONFIG`` is the resolved result, built once at import. Everything else in
-Terminus reads it rather than re-reading the file, so there is exactly one
-resolved configuration per process. A write goes through
-``terminus.cli_app.settings.set_value``, which edits that same file in place so
+``CONFIG`` is the resolved result. It is rebuilt by :func:`load_config`, which
+the CLI calls on every invocation so that the project layer follows the directory
+the command was actually run from - a value resolved once at import would be
+frozen to whatever directory the interpreter happened to start in. Everything else
+in Terminus reads ``CONFIG`` rather than re-reading the file, and ``load_config``
+updates that one dict in place, so there is exactly one live configuration and a
+dozen modules holding a reference to it cannot disagree. A write goes through
+``terminus.cli_app.settings.set_value``, which edits the same file in place so
 ``terminus config set`` and a hand edit cannot disagree.
 """
 
@@ -63,7 +73,12 @@ DEFAULT_CONFIG = {
         # automatic fallback - if this is on and Docker is unreachable, commands
         # fail rather than quietly running on the host.
         "enabled": True,
-        "image": "terminus-sandbox:latest",
+        # Must equal terminus.sandbox.SANDBOX_IMAGE. start_sandbox reads this key,
+        # so a value that drifts from the constant silently wins: the pinned tag
+        # says "run the toolbelt whose contents are known" while the session
+        # starts whatever `latest` currently points at. tests/test_sandbox.py
+        # asserts the two agree.
+        "image": "terminus-sandbox:0.1.0",
     },
     "memory": {
         "db_path": ".terminus/memory/terminus.db",

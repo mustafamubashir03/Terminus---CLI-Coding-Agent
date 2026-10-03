@@ -242,7 +242,7 @@ def _reset_write_scopes() -> None:
     _write_scopes._holders.clear()
 
 
-def child_policy(role: AgentRole) -> PermissionPolicy:
+def child_permission_policy(role: AgentRole) -> PermissionPolicy:
     """The policy a child runs under.
 
     Built from the role, not from the parent, and deliberately narrow: read-only
@@ -353,7 +353,7 @@ class ChildAgent:
                 f"{', '.join(role_names())}"
             )
         self.role = role
-        self.policy = child_policy(role)
+        self.policy = child_permission_policy(role)
         self.timeout = spec.timeout or role.timeout_seconds or DEFAULT_CHILD_TIMEOUT_SECONDS
 
         # Requested tools are intersected with the role's, then with what the
@@ -473,7 +473,18 @@ class ChildAgent:
             outcome.agent_id = self.agent_id
             outcome.role = self.role.name
         else:
-            self.result.summary = str(outcome or "")
+            summary = str(outcome or "").strip()
+            if not summary:
+                # The run returned without raising and without saying anything.
+                # Reporting that as completed would tell the parent a child
+                # succeeded on the strength of a process exiting cleanly, which is
+                # the failure mode this status exists to rule out.
+                self.result.status = AgentStatus.FAILED
+                self.result.error = (
+                    "the child agent finished without producing any output"
+                )
+                logger.warning("Child %s produced no output", self.agent_id)
+            self.result.summary = summary
         self.result.skills = list(self.skills)
         self.result.tools = list(self.tools)
         if self.result.status in (AgentStatus.QUEUED, AgentStatus.RUNNING):

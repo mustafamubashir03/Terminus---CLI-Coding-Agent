@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import inspect
 import os
-import subprocess
 
 import pytest
 
@@ -291,12 +290,41 @@ def test_stop_removes_the_container_and_is_repeatable(tmp_path):
 
 
 def test_the_workspace_mount_is_verified_at_startup(tmp_path):
-    """A healthy container with an empty /workspace must not be trusted."""
-    container = FakeContainer(probe_result=(0, (b"", b"")))
-    sandbox, _ = make_sandbox(tmp_path, container=container)
+    """A healthy container whose /workspace is not the host tree is refused.
+
+    The container here is running and answering every command; what it does not
+    have is the host workspace. ``workspace=None`` is how the fake models a mount
+    that never happened, so ``/workspace`` is an empty directory - which exists,
+    and is a directory, and is the reason a check that only asks "is /workspace a
+    directory?" passes against the one container it must never pass.
+    """
+    sandbox, _ = make_sandbox(tmp_path, workspace=None)
     with pytest.raises(SandboxUnavailable) as exc:
         sandbox.start()
     assert "not the host workspace" in str(exc.value)
+    assert sandbox.started is False
+    assert not list(tmp_path.glob(".terminus-sandbox-probe-*")), (
+        "the probe file is the workspace's own file; it must not be left behind"
+    )
+
+
+def test_the_mount_check_reads_the_token_back_rather_than_asking_for_a_directory(
+    tmp_path,
+):
+    """The check has to be able to fail, which "is /workspace a dir?" cannot.
+
+    Pins the specific mistake: the image creates /workspace at build time, so a
+    directory test is answered by the image whether or not a bind mount exists.
+    """
+    sandbox, collection = make_sandbox(tmp_path)
+    sandbox.start()
+    probe = [
+        call["cmd"]
+        for call in collection.container.execs
+        if "cat " in " ".join(str(part) for part in call["cmd"])
+    ]
+    assert probe, "startup must read a host-written token back out of /workspace"
+    assert "test -d" not in " ".join(str(p) for p in probe[0])
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +516,8 @@ def test_a_docker_error_during_cleanup_does_not_stop_startup(tmp_path):
 ])
 def test_shell_quote_round_trips_through_a_real_shell(value):
     """Not a hand-rolled subset: ask sh what the quoting actually produced."""
+    import subprocess
+
     quoted = Sandbox._shell_quote(value)
     if os.name == "nt":
         pytest.skip("no POSIX shell available to verify quoting")
@@ -578,3 +608,176 @@ def test_the_sandbox_is_installed_per_execution_not_globally(tmp_path):
         assert current_sandbox() is None
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# The boundary itself: no silent fall back to the host
+# ---------------------------------------------------------------------------
+
+
+class ExplodingSandbox:
+    """A container that fails the way a broken Docker daemon does."""
+
+    sandbox_id = "broken"
+    container_name = "terminus-sandbox-broken"
+
+    def __init__(self, message="daemon gone"):
+        self.message = message
+        self.commands: list[str] = []
+
+    def execute(self, command, timeout=None, cwd=None):
+        self.commands.append(command)
+        raise SandboxUnavailable(self.message)
+
+
+def _allow_read_only():
+    """The real decision object, so the tests exercise the real formatting path."""
+    from terminus.permissions import PermissionDecision, PermissionLevel
+
+    return PermissionDecision(
+        allowed=True,
+        level=PermissionLevel.READ_ONLY,
+        reason="test",
+        requires_approval=False,
+    )
+
+
+def _host_is_unreachable(monkeypatch, module_under_test):
+    """Make the host path fail the test if anything reaches for it."""
+    def forbidden(*_a, **_k):
+        raise AssertionError(
+            f"{module_under_test.__name__} fell back to the host"
+        )
+
+    monkeypatch.setattr(module_under_test.subprocess, "run", forbidden)
+    monkeypatch.setattr(module_under_test.subprocess, "Popen", forbidden)
+
+
+def test_a_failed_sandbox_is_never_re_run_on_the_host(tmp_path, monkeypatch):
+    """The central guarantee, on both tools, with the host path booby-trapped."""
+    from terminus.sandbox import sandbox_scope
+    from terminus.tools import shell_tools, terminal_tools
+
+    sandbox = ExplodingSandbox()
+    for module_under_test in (shell_tools, terminal_tools):
+        _host_is_unreachable(monkeypatch, module_under_test)
+        with sandbox_scope(sandbox):
+            if module_under_test is shell_tools:
+                out = module_under_test._execute("echo hi", tmp_path, _allow_read_only())
+            else:
+                out = module_under_test._execute("echo hi", tmp_path)
+        assert "daemon gone" in out, f"{module_under_test.__name__} hid the failure"
+        assert "timed out" not in out.lower(), (
+            f"{module_under_test.__name__} reported a Docker failure as a timeout, "
+            "which is a claim about a command that never ran"
+        )
+
+
+def test_a_failed_sandbox_does_not_leak_a_command_to_the_host(tmp_path, monkeypatch):
+    """No host process is even started, as distinct from starting one and failing."""
+    from terminus.sandbox import sandbox_scope
+    from terminus.tools import shell_tools
+
+    started = []
+    monkeypatch.setattr(
+        shell_tools.subprocess, "Popen", lambda *a, **k: started.append(a)
+    )
+    with sandbox_scope(ExplodingSandbox()):
+        shell_tools._execute("echo hi", tmp_path, _allow_read_only())
+    assert started == [], "the host process was started before the sandbox failed"
+
+
+def test_session_startup_refuses_to_run_unsandboxed(monkeypatch):
+    """An enabled boundary that will not start must end the session.
+
+    The alternative - log a warning, leave the sandbox unset, and carry on -
+    produces a session that believes it is sandboxed while every command runs on
+    the host. That is the failure this test exists to prevent, so it is asserted
+    at the point where the choice is made.
+    """
+    import asyncio
+
+    from terminus import cli
+    from terminus.sandbox import SandboxError
+
+    class Unstartable:
+        container_name = "terminus-sandbox-unstartable"
+
+        def start(self):
+            raise SandboxUnavailable("no docker daemon")
+
+    monkeypatch.setattr(cli, "sandbox_enabled", lambda: True, raising=False)
+    monkeypatch.setattr("terminus.sandbox.sandbox_enabled", lambda: True)
+    monkeypatch.setattr("terminus.sandbox.Sandbox", lambda **_k: Unstartable())
+
+    with pytest.raises(SandboxError):
+        asyncio.run(cli.start_sandbox())
+
+
+def test_session_startup_is_a_choice_when_the_boundary_is_off(monkeypatch):
+    """Disabling the boundary is how you run without Docker; it is not a failure."""
+    import asyncio
+
+    from terminus import cli
+
+    monkeypatch.setattr("terminus.sandbox.sandbox_enabled", lambda: False)
+    assert asyncio.run(cli.start_sandbox()) is None
+
+
+def test_a_host_path_failure_is_still_reported_as_a_command_problem(
+    tmp_path, monkeypatch
+):
+    """The boundary being off must not have quietly broken the pre-existing path."""
+    import subprocess as real_subprocess
+
+    from terminus.tools import terminal_tools
+
+    monkeypatch.setattr(
+        terminal_tools.subprocess,
+        "run",
+        lambda *a, **k: real_subprocess.CompletedProcess(
+            args=a[0] if a else "", returncode=0, stdout="Python 3.12.0", stderr=""
+        ),
+    )
+    out = terminal_tools._execute("python --version", None)
+    assert "Python 3.12.0" in out
+
+
+def test_the_sandbox_reaches_a_child_task_the_way_a_plan_worker_runs(tmp_path):
+    """The /plan workers run in child tasks; they must inherit the container.
+
+    A ContextVar that was only ever set on the REPL's own task would leave every
+    worker running on the host while the session reported a sandbox - the same
+    silent downgrade this boundary is meant to remove, one task boundary away.
+    """
+    import asyncio
+
+    from terminus.sandbox import current_sandbox, sandbox_scope
+
+    async def scenario():
+        sandbox = Sandbox(client=FakeClient(), workspace=tmp_path)
+        with sandbox_scope(sandbox):
+
+            async def worker():
+                return current_sandbox()
+
+            found = await asyncio.gather(worker(), worker(), worker())
+        assert found == [sandbox, sandbox, sandbox]
+
+    asyncio.run(scenario())
+
+
+def test_the_configured_image_is_the_one_the_code_pins():
+    """config.yaml's default and the module constant must not drift.
+
+    start_sandbox reads CONFIG, not the constant, so a stale default quietly
+    overrides the pinned tag and every session runs whatever `latest` happens to
+    be - the exact thing pinning the tag was for.
+    """
+    from terminus.config import CONFIG
+    from terminus.sandbox import SANDBOX_IMAGE
+
+    assert CONFIG["sandbox"]["image"] == SANDBOX_IMAGE
+    assert CONFIG["sandbox"]["image"] != "terminus-sandbox:latest", (
+        "latest changes under a session without anyone rebuilding anything"
+    )

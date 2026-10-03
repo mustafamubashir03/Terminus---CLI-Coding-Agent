@@ -96,7 +96,7 @@ substitution and redirection mean what they mean to the permission classifier
 that just approved them."""
 
 _WORKSPACE_ENVIRONMENT = {
-    "HOME": "/root",
+    "HOME": "/home/agent",
     "TERM": "xterm",
     "LANG": "C.UTF-8",
 }
@@ -105,6 +105,11 @@ _WORKSPACE_ENVIRONMENT = {
 Deliberately not the host's. ``terminus.permissions.sanitized_env`` decides what
 a *host* subprocess may see, and it still does for the tools' own use; a
 container gets a fixed minimal set and never the developer's shell.
+
+HOME is the image's own unprivileged home, matching the user the image runs as.
+Pointing it at /root while running as uid 1000 hands every tool a directory it
+cannot write, which surfaces as permission errors in whatever the agent tries to
+cache there.
 """
 
 
@@ -239,7 +244,19 @@ class Sandbox:
             ) from exc
 
         self._container = container
-        self._wait_for_running()
+        try:
+            self._wait_for_running()
+        except BaseException:
+            # A container that started but did not come up properly is not left
+            # behind. It would still be "started" as far as `started` is concerned
+            # - that property asks whether there is a container, not whether it
+            # passed its checks - so a caller catching the error could carry on
+            # and execute against a tree that was just rejected. Removing it also
+            # stops the next session's orphan sweep from having to: that sweep
+            # only reclaims stopped containers, by design, because a *running*
+            # container may belong to another live session.
+            self.stop()
+            raise
 
     def stop(self) -> None:
         """Remove the container. Never raises."""
